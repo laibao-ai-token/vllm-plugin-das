@@ -172,6 +172,57 @@ def fp4_physical_page_size(cache: torch.Tensor) -> int:
     return rows
 
 
+def fp4_prefill_query_chunk_rows(max_model_len: int, max_logits_bytes: int) -> int:
+    """Bound LightOp's fixed-width FP32 logits by splitting query rows."""
+    width = (max_model_len + 3) // 4 * 4
+    return max(1, max_logits_bytes // max(1, width * 4))
+
+
+def fp4_indexer_workspace_bytes(
+    *,
+    query_rows: int,
+    decode_rows: int,
+    max_model_len: int,
+    total_seq_lens: int,
+    topk_tokens: int,
+    num_query_heads: int,
+    max_logits_bytes: int,
+    physical_page_size: int = 0,
+) -> int:
+    """Account for tensors that coexist in the HCU reader, in bytes.
+
+    Decode rows are bounded by requests times the speculative verification
+    width, independently of the dummy prefill token count. Unknown page
+    geometry conservatively includes staging; native 64-row pages need none.
+    Prefill uses the same query chunk bound as the real LightOp caller.
+    """
+    prefill_width = (max_model_len + 3) // 4 * 4
+    decode_width = (max_model_len + 255) // 256 * 256
+    staging_width = (max_model_len + 63) // 64 * 64
+    prefill_rows = min(
+        query_rows, fp4_prefill_query_chunk_rows(max_model_len, max_logits_bytes)
+    )
+    decode_rows = min(query_rows, decode_rows)
+    # Live logits + masked copy + valid/inverted masks. Top-k conversions and
+    # the deterministic short-row selection need O(rows * topk) scratch too.
+    def score_bytes(rows, width):
+        return rows * (width * (4 + 4 + 1 + 1) + topk_tokens * 32) + width * 8
+
+    # The K gather retains int64 slots and 68-byte FP4 records. This also
+    # covers fp4_chunk_slots' O(N) index-building peak before scoring starts.
+    prefill_bytes = total_seq_lens * (FP4_RECORD_BYTES + 8)
+    prefill_bytes += score_bytes(prefill_rows, prefill_width)
+    prefill_bytes += prefill_rows * num_query_heads * FP4_HEAD_DIM * 2
+    staging_bytes = native_pool_bytes = 0
+    if physical_page_size != FP4_PAGE_BLOCK_SIZE and decode_rows:
+        staging_bytes = decode_rows * staging_width * (2 * FP4_RECORD_BYTES + 3 * 8 + 1)
+        staging_bytes += staging_width * 40 + decode_rows * (staging_width // 64) * 4
+        native_pool_bytes = decode_rows * staging_width * FP4_RECORD_BYTES
+    decode_bytes = native_pool_bytes + score_bytes(decode_rows, decode_width)
+    decode_bytes += decode_rows * num_query_heads * FP4_RECORD_BYTES
+    return max(staging_bytes, prefill_bytes, decode_bytes)
+
+
 def stage_fp4_decode_pages(cache, block_table, row_ends, max_context_len):
     """Byte-copy non-64-row allocator pages into a transient native ABI pool.
 
@@ -359,6 +410,8 @@ __all__ = [
     "fp4_chunk_slots",
     "fp4_flat_page_view",
     "fp4_physical_page_size",
+    "fp4_indexer_workspace_bytes",
+    "fp4_prefill_query_chunk_rows",
     "fp4_indexer_requested",
     "lightop_fp4_decode",
     "lightop_gather_index_k_fp4",

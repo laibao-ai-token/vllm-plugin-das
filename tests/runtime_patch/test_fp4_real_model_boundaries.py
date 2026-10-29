@@ -13,6 +13,8 @@ from vllm_hcu.model_executor.layers.fp4_indexer import (
     fp4_chunk_slots,
     fp4_flat_page_view,
     fp4_physical_page_size,
+    fp4_indexer_workspace_bytes,
+    fp4_prefill_query_chunk_rows,
     stage_fp4_decode_pages,
 )
 from vllm_hcu.model_executor.layers import fp4_indexer as fp4
@@ -25,15 +27,24 @@ ROOT = Path(__file__).resolve().parents[2]
 def _reader(layer, **replacements):
     path = ROOT / "vllm_hcu/v1/attention/ops/rocm_aiter_mla_sparse.py"
     names = {"_hcu_fp4_sparse_attn_indexer_native", "_topk_indices_torch",
-             "_decode_row_ends_from_seq_lens"}
+             "_decode_row_ends_from_seq_lens", "rocm_aiter_sparse_attn_indexer_native"}
     tree = ast.parse(path.read_text())
     selected = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in names]
-    ns = dict(torch=torch, Fp4QTuple=Fp4QTuple,
+    ns = dict(torch=torch, Fp4QTuple=Fp4QTuple, LayerNameType=str,
               get_forward_context=lambda: SimpleNamespace(attn_metadata={"cache": layer}),
               _resolve_layer_name=lambda x: x, fp4_chunk_slots=fp4_chunk_slots,
               fp4_flat_page_view=fp4_flat_page_view)
     ns.update(fp4_physical_page_size=fp4_physical_page_size,
-              stage_fp4_decode_pages=stage_fp4_decode_pages)
+              stage_fp4_decode_pages=stage_fp4_decode_pages,
+              fp4_indexer_workspace_bytes=fp4_indexer_workspace_bytes,
+              fp4_prefill_query_chunk_rows=fp4_prefill_query_chunk_rows,
+              venvs=SimpleNamespace(VLLM_SPARSE_INDEXER_MAX_LOGITS_MB=512))
+    # Both FP4 Top-K sites try the fused ragged-v2 selector before the exact
+    # Torch reference. These boundary tests assert the reference result, so pin
+    # the adapter off rather than depending on the installed LightOp.
+    ns.update(henvs=SimpleNamespace(VLLM_HCU_USE_CUSTOM_OPS=False,
+                                    VLLM_HCU_USE_LIGHTOP_INDEXER_TOPK_ADAPTER=False),
+              decode_topk_v2=lambda *args, **kwargs: False)
     ns.update(replacements)
     exec(compile(ast.Module(body=selected, type_ignores=[]), str(path), "exec"), ns)
     return ns["_hcu_fp4_sparse_attn_indexer_native"]
@@ -282,7 +293,7 @@ def test_prefill_aligns_output_width_without_changing_gather_or_row_lengths(
     def scorer(q, packed, scales, weights, ks, ke, *, max_seqlen_k):
         assert max_seqlen_k == expected_width
         assert max_seqlen_k % 4 == 0
-        assert ks is starts and ke is ends
+        assert torch.equal(ks, starts) and torch.equal(ke, ends)
         assert packed.shape[0] == scales.shape[0] == max_model_len + 2
         logits = torch.arange(expected_width, dtype=torch.float32).repeat(3, 1)
         for row, length in enumerate((max_model_len, 2, 0)):
@@ -323,7 +334,7 @@ def test_topk_masks_extreme_alignment_padding_and_returns_invalid_sentinel():
     (4096, 4096), (4097, 4100), (4098, 4100), (4099, 4100),
 ])
 @pytest.mark.parametrize("total_seq_lens", [2, 32768])
-def test_fp4_profile_accounts_for_aligned_prefill_and_unchanged_staging(
+def test_fp4_profile_accounts_for_aligned_prefill_and_unknown_geometry(
     max_model_len, prefill_width, total_seq_lens
 ):
     allocations = []
@@ -337,19 +348,154 @@ def test_fp4_profile_accounts_for_aligned_prefill_and_unchanged_staging(
     fn = _reader(None, torch=SimpleNamespace(empty=allocate, uint8=torch.uint8,
                                             Tensor=torch.Tensor),
                  get_forward_context=lambda: SimpleNamespace(attn_metadata=None))
-    returned = fn(hidden, "cache", None, None, None, None, 128, "ue8m0", 3,
+    returned = fn(hidden, "cache", None, _query(2), None, None, 128, "ue8m0", 3,
                   128, max_model_len, total_seq_lens, out, skip_k_cache_insert=True)
-    staging_bytes = 2 * ((max_model_len + 63) // 64 * 64) * (2 * 68 + 3 * 8 + 1)
-    prefill_bytes = total_seq_lens * 68 + 2 * prefill_width * 4
+    staging_bytes = 2 * ((max_model_len + 63) // 64 * 64) * 161
+    prefill_live = total_seq_lens * 76 + 2 * prefill_width * 10
     assert returned is out
-    assert allocations == [(max(staging_bytes, prefill_bytes), torch.uint8, hidden.device)]
-    assert allocations[0][0] >= staging_bytes
-    assert allocations[0][0] >= prefill_bytes
-    if total_seq_lens == 32768:
-        old_prefill_bytes = total_seq_lens * 68 + 2 * max_model_len * 4
-        assert prefill_bytes > staging_bytes
-        assert allocations[0][0] - old_prefill_bytes == 2 * (prefill_width - max_model_len) * 4
-    else:
-        assert staging_bytes > prefill_bytes
-    print(f"P2_PROFILE max_model_len={max_model_len} total_seq_lens={total_seq_lens} "
-          f"prefill={prefill_bytes} staging={staging_bytes} allocated={allocations[0][0]}")
+    assert len(allocations) == 1
+    assert allocations[0][1:] == (torch.uint8, hidden.device)
+    assert allocations[0][0] >= max(staging_bytes, prefill_live)
+
+
+@pytest.mark.parametrize("ratio,page_size", [(1, 64), (2, 32)])
+def test_profile_8192_tokens_uses_192_decode_rows_without_large_allocation(ratio, page_size):
+    allocations, budgets = [], []
+
+    def budget(**kwargs):
+        budgets.append(kwargs)
+        return fp4_indexer_workspace_bytes(**kwargs)
+
+    def allocate(size, **kwargs):
+        allocations.append(size)
+        return object()
+
+    hidden = SimpleNamespace(shape=(8192, 128), device=torch.device("cpu"))
+    query = SimpleNamespace(bf16=SimpleNamespace(shape=(8192, 32, 128)))
+    fn = _reader(
+        None, get_forward_context=lambda: SimpleNamespace(attn_metadata=None),
+        fp4_indexer_workspace_bytes=budget,
+        torch=SimpleNamespace(empty=allocate, uint8=torch.uint8, Tensor=torch.Tensor),
+    )
+    index_len = 49152 // ratio
+    marker = object()
+    assert fn(hidden, "cache", None, query, None, None, 128, "ue8m0", 512,
+              128, index_len, 40 * index_len, marker, skip_k_cache_insert=True,
+              fp4_profile_max_decode_tokens=192,
+              fp4_profile_page_size=page_size) is marker
+    assert budgets[0]["decode_rows"] == 192
+    assert budgets[0]["physical_page_size"] == page_size
+    assert budgets[0]["max_model_len"] == index_len  # PCP must not divide K width.
+    assert 512 * 1024**2 < allocations[0] < 2 * 1024**3
+    if ratio == 2:
+        assert 8192 * index_len * 161 == 30.1875 * 1024**3
+        assert allocations[0] >= 192 * index_len * 161
+
+
+def test_eager_profile_retains_constructor_budget_after_config_scope_exits():
+    allocations = []
+    reader = _reader(
+        None, get_forward_context=lambda: SimpleNamespace(attn_metadata=None),
+        torch=SimpleNamespace(empty=lambda size, **kw: allocations.append(size),
+                              uint8=torch.uint8, Tensor=torch.Tensor),
+    )
+    source = ROOT / "vllm_hcu/model_executor/layers/sparse_attn_indexer.py"
+    tree = ast.parse(source.read_text())
+    cls = next(node for node in tree.body
+               if isinstance(node, ast.ClassDef) and node.name == "SparseAttnIndexer")
+    cls.decorator_list = []
+    cls.body = [node for node in cls.body
+                if isinstance(node, ast.FunctionDef) and node.name in ("__init__", "forward_hip")]
+    config_scope = [SimpleNamespace(
+        scheduler_config=SimpleNamespace(max_num_seqs=32, max_num_batched_tokens=8192),
+        num_speculative_tokens=5,
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1,
+                                         prefill_context_parallel_size=8),
+    )]
+    namespace = dict(
+        torch=torch, CustomOp=torch.nn.Module,
+        get_current_vllm_config=lambda: config_scope[0],
+        current_platform=SimpleNamespace(is_cuda=lambda: False),
+        _encode_layer_name=lambda name: name,
+        Fp4QTuple=Fp4QTuple, Fp4IndexerQuery=fp4.Fp4IndexerQuery,
+        rocm_aiter_sparse_attn_indexer_native=(
+            reader.__globals__["rocm_aiter_sparse_attn_indexer_native"]
+        ),
+    )
+    exec(compile(ast.Module(body=[cls], type_ignores=[]), str(source), "exec"), namespace)
+    marker = object()
+    instance = namespace["SparseAttnIndexer"](
+        SimpleNamespace(prefix="cache", kv_cache=torch.empty(0)),
+        128, "ue8m0", 512, 128, 24576, 40 * 24576, marker,
+        skip_k_cache_insert=True, use_fp4_cache=True, compress_ratio=2,
+    )
+    config_scope[0] = None  # MRV2 eager profile has no construction config.
+    assert instance.fp4_profile_max_decode_tokens == 192
+    assert instance.fp4_profile_page_size == 32
+    query = Fp4QTuple(None, None, SimpleNamespace(shape=(8192, 32, 128)))
+    hidden = SimpleNamespace(shape=(8192, 128), device=torch.device("cpu"))
+    assert instance.forward_hip(hidden, query, None, None) is marker
+    assert len(allocations) == 1 and allocations[0] < 2 * 1024**3
+
+
+def test_native_64_row_pages_skip_only_decode_staging_budget():
+    args = dict(query_rows=192, decode_rows=192, max_model_len=24576,
+                total_seq_lens=0, topk_tokens=512, num_query_heads=32,
+                max_logits_bytes=0)
+    native = fp4_indexer_workspace_bytes(**args, physical_page_size=64)
+    staged = fp4_indexer_workspace_bytes(**args, physical_page_size=32)
+    unknown = fp4_indexer_workspace_bytes(**args)
+    assert staged == unknown and staged > native
+    assert native >= 192 * 24576 * 10  # Keep logits and masking copies.
+    assert staged >= 192 * 24576 * 161
+
+
+def test_prefill_query_chunks_preserve_windows_candidates_and_release_logits():
+    import weakref
+
+    starts = torch.tensor([0, 0, 2, 2, 2], dtype=torch.int32)
+    ends = torch.tensor([1, 2, 3, 4, 5], dtype=torch.int32)
+    chunk = SimpleNamespace(
+        token_start=1, token_end=6, local_total_seq_lens=5,
+        block_table=torch.tensor([[0], [1]], dtype=torch.int32),
+        token_to_seq=torch.tensor([0, 0, 1, 1, 1], dtype=torch.int32),
+        cu_seq_lens=torch.tensor([0, 2, 5], dtype=torch.int32),
+        cu_seqlen_ks=starts, cu_seqlen_ke=ends,
+    )
+    layer = SimpleNamespace(prefill=SimpleNamespace(chunks=[chunk]), decode=None,
+                            num_prefills=2, num_decodes=0)
+    candidates = torch.arange(6, dtype=torch.int32)[:, None]
+    last_logits, policy_rows, scorer_rows = [], [], []
+
+    def gather(cache, slots, page_size):
+        assert slots.tolist() == [0, 1, 64, 65, 66]
+        return torch.zeros(5, 64, dtype=torch.int8), torch.zeros(5, dtype=torch.int32)
+
+    def scorer(q, packed, scales, weights, ks, ke, *, max_seqlen_k):
+        assert not last_logits or last_logits[-1]() is None
+        scorer_rows.append(len(q))
+        logits = torch.arange(max_seqlen_k).float().repeat(len(q), 1)
+        last_logits.append(weakref.ref(logits))
+        return logits
+
+    def policy(logits, unused, row_lens, blocks, block_size, write):
+        policy_rows.extend(blocks[:, 0].tolist())
+
+    outputs = []
+    for budget_mb in (0, 512):
+        policy_rows.clear()
+        scorer_rows.clear()
+        fn = _reader(layer, lightop_gather_index_k_fp4=gather,
+                     lightop_fp4_prefill=scorer, _apply_candidate_policy=policy,
+                     venvs=SimpleNamespace(VLLM_SPARSE_INDEXER_MAX_LOGITS_MB=budget_mb))
+        out = torch.full((6, 1), -9, dtype=torch.int32)
+        fn(None, "cache", torch.zeros(2, 64, 68, dtype=torch.uint8), _query(6),
+           None, torch.ones(6, 32), 128, "ue8m0", 1, 128, 64, 5, out,
+           skip_k_cache_insert=True, candidate_blocks=candidates,
+           candidate_block_size=8, candidate_write=False)
+        assert policy_rows == [1, 2, 3, 4, 5]
+        assert scorer_rows == ([1] * 5 if budget_mb == 0 else [5])
+        assert last_logits[-1]() is None
+        outputs.append(out)
+    assert torch.equal(outputs[0], outputs[1])
+    assert outputs[0][:, 0].tolist() == [-1, 0, 1, 0, 1, 2]

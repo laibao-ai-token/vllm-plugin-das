@@ -961,7 +961,20 @@ class SparseAttnIndexer(CustomOp):
         # DCP scalars are constant for the run; resolve them here (config is set
         # during model construction) and pass them into the custom op, rather
         # than threading them through per-step metadata.
-        parallel_config = get_current_vllm_config().parallel_config
+        config = get_current_vllm_config()
+        parallel_config = config.parallel_config
+        self.fp4_profile_max_decode_tokens = None
+        self.fp4_profile_page_size = 0
+        if use_fp4_cache:
+            scheduler = config.scheduler_config
+            self.fp4_profile_max_decode_tokens = min(
+                scheduler.max_num_batched_tokens,
+                scheduler.max_num_seqs * (1 + config.num_speculative_tokens),
+            )
+            # The opted-in HCU backend's kernel block covers 64 original
+            # tokens. Cache records are compressed before the LightOp reader.
+            if compress_ratio in (1, 2):
+                self.fp4_profile_page_size = 64 // compress_ratio
         self.dcp_world_size = parallel_config.decode_context_parallel_size
         self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_world_size > 1 else 0
         self._parallel_config = parallel_config
@@ -1054,8 +1067,8 @@ class SparseAttnIndexer(CustomOp):
         weights: torch.Tensor,
     ):
         if self.use_fp4_cache:
-            if self.use_pcp or self.dcp_world_size != 1:
-                raise RuntimeError("HCU FP4 indexer does not support context parallelism")
+            if self.dcp_world_size != 1:
+                raise RuntimeError("HCU FP4 indexer does not support decode context parallelism")
             if not isinstance(q_quant, (Fp4IndexerQuery, Fp4QTuple)):
                 raise RuntimeError(
                     "HCU FP4 indexer requires the phase-1 BF16/packed query adapter"
@@ -1077,6 +1090,10 @@ class SparseAttnIndexer(CustomOp):
                 self.max_total_seq_len,
                 self.topk_indices_buffer,
                 skip_k_cache_insert=self.skip_k_cache_insert,
+                fp4_profile_max_decode_tokens=getattr(
+                    self, "fp4_profile_max_decode_tokens", None
+                ),
+                fp4_profile_page_size=getattr(self, "fp4_profile_page_size", 0),
                 dcp_rank=getattr(self, "dcp_rank", 0),
                 dcp_world_size=getattr(self, "dcp_world_size", 1),
                 cp_kv_cache_interleave_size=getattr(

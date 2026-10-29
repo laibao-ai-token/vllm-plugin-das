@@ -11,6 +11,7 @@ from inspect import Parameter, signature
 import torch
 import torch.nn.functional as F
 
+import vllm.envs as venvs
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.attention.dsa.candidate_blocks import (
@@ -37,6 +38,8 @@ from vllm_hcu.v1.attention.ops.decode_topk import get_decode_topk_output_buffer
 from vllm_hcu.model_executor.layers.fp4_indexer import (
     Fp4QTuple,
     fp4_chunk_slots,
+    fp4_indexer_workspace_bytes,
+    fp4_prefill_query_chunk_rows,
     fp4_flat_page_view,
     fp4_physical_page_size,
     lightop_fp4_decode,
@@ -1609,25 +1612,37 @@ def _hcu_fp4_sparse_attn_indexer_native(
     candidate_blocks=None,
     candidate_block_size=0,
     candidate_write=False,
+    fp4_profile_max_decode_tokens=None,
+    fp4_profile_page_size=0,
 ):
-    """HCU-owned ratio1 FP4 reader lifecycle using current LightOp wrappers.
+    """HCU FP4 reader for replicated K caches, including eager PCP8.
 
-    This path is selected only by the constructor-time V4.1 capability gate.
-    It intentionally rejects DCP/PCP metadata here rather than falling back to
-    an FP8 reader after FP4 allocation.
+    DCP remains gated by the caller. Prefill queries are chunked separately
+    from decode staging so profiling can reserve each real phase's peak.
     """
     metadata = get_forward_context().attn_metadata
     prefill_width = ((max_model_len + 3) // 4) * 4
+    max_logits_bytes = max(0, venvs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB) * 1024**2
     if not isinstance(metadata, dict):
-        # Account for the new byte-staging peak during vLLM's memory profile:
-        # gathered bytes + native pool + slot/index tensors. Do not let the
-        # allocator fill memory with cache blocks that this reader then needs.
         rows = hidden_states.shape[0]
-        width = ((max_model_len + 63) // 64) * 64
-        staging_bytes = rows * width * (2 * 68 + 3 * 8 + 1)
-        prefill_bytes = total_seq_lens * 68 + rows * prefill_width * 4
-        _workspace = torch.empty(max(staging_bytes, prefill_bytes),
-                                 dtype=torch.uint8, device=hidden_states.device)
+        # Eager MRV2 profiling runs after the temporary construction config
+        # scope has exited. The layer freezes these values in __init__.
+        decode_rows = (
+            rows if fp4_profile_max_decode_tokens is None
+            else min(rows, fp4_profile_max_decode_tokens)
+        )
+        page_size = fp4_profile_page_size
+        if isinstance(kv_cache, torch.Tensor) and kv_cache.ndim >= 2:
+            page_size = fp4_physical_page_size(kv_cache)
+        workspace_bytes = fp4_indexer_workspace_bytes(
+            query_rows=rows, decode_rows=decode_rows,
+            max_model_len=max_model_len, total_seq_lens=total_seq_lens,
+            topk_tokens=topk_tokens, num_query_heads=q_query.bf16.shape[-2],
+            max_logits_bytes=max_logits_bytes, physical_page_size=page_size,
+        )
+        _workspace = torch.empty(
+            workspace_bytes, dtype=torch.uint8, device=hidden_states.device
+        )
         return topk_indices_buffer
     del hidden_states, k, quant_block_size, scale_fmt, total_seq_lens
     prefix = _resolve_layer_name(k_cache_prefix)
@@ -1658,40 +1673,58 @@ def _hcu_fp4_sparse_attn_indexer_native(
             k_packed, k_scales = lightop_gather_index_k_fp4(
                 fp4_flat_page_view(kv_cache), slots, page_size
             )
-            logits = lightop_fp4_prefill(
-                q_query.bf16[chunk.token_start:chunk.token_end].contiguous(),
-                k_packed,
-                k_scales,
-                weights[chunk.token_start:chunk.token_end],
-                chunk.cu_seqlen_ks,
-                chunk.cu_seqlen_ke,
-                max_seqlen_k=prefill_width,
+            query_chunk_rows = fp4_prefill_query_chunk_rows(
+                max_model_len, max_logits_bytes
             )
-            # LightOp FP4 prefill returns window-local columns, not columns
-            # in the concatenated K workspace. Candidate IDs/top-k are local
-            # to that same request window, including for the second request.
-            row_lens = chunk.cu_seqlen_ke - chunk.cu_seqlen_ks
-            if candidate_blocks is not None:
-                _apply_candidate_policy(
-                    logits,
-                    None,
-                    row_lens,
-                    candidate_blocks[chunk.token_start:chunk.token_end],
-                    candidate_block_size,
-                    candidate_write,
+            for token_start in range(chunk.token_start, chunk.token_end, query_chunk_rows):
+                token_end = min(token_start + query_chunk_rows, chunk.token_end)
+                row_start = token_start - chunk.token_start
+                row_end = token_end - chunk.token_start
+                logits = lightop_fp4_prefill(
+                    q_query.bf16[token_start:token_end].contiguous(),
+                    k_packed,
+                    k_scales,
+                    weights[token_start:token_end],
+                    chunk.cu_seqlen_ks[row_start:row_end],
+                    chunk.cu_seqlen_ke[row_start:row_end],
+                    max_seqlen_k=prefill_width,
                 )
-            # LightOp FP4 prefill returns window-local columns, so the window
-            # starts at column 0 and the row length doubles as the row end.
-            # Try the fused ragged-v2 selector first; any ABI mismatch falls
-            # back to the exact Torch reference below.
-            if not (
-                henvs.VLLM_HCU_USE_CUSTOM_OPS
-                and henvs.VLLM_HCU_USE_LIGHTOP_INDEXER_TOPK_ADAPTER
-                and decode_topk_v2(logits, row_lens, out, topk_tokens)
-            ):
-                out.copy_(_topk_indices_torch(
-                    logits, topk_tokens, row_ends=row_lens
-                ))
+                # Columns are local to each request window, including when
+                # query rows are split further to bound the logits workspace.
+                row_lens = (
+                    chunk.cu_seqlen_ke[row_start:row_end]
+                    - chunk.cu_seqlen_ks[row_start:row_end]
+                )
+                if candidate_blocks is not None:
+                    _apply_candidate_policy(
+                        logits,
+                        None,
+                        row_lens,
+                        candidate_blocks[token_start:token_end],
+                        candidate_block_size,
+                        candidate_write,
+                    )
+                # Rebinding ``out`` to this query subchunk's rows keeps the
+                # guarded Top-K site below identical to the whole-chunk case
+                # while still leaving rows scored by earlier iterations
+                # untouched.
+                out = topk_indices_buffer[token_start:token_end, :topk_tokens]
+                # LightOp FP4 prefill returns window-local columns, so the
+                # window starts at column 0 and the row length doubles as the
+                # row end. Try the fused ragged-v2 selector first; any ABI
+                # mismatch falls back to the exact Torch reference below.
+                if not (
+                    henvs.VLLM_HCU_USE_CUSTOM_OPS
+                    and henvs.VLLM_HCU_USE_LIGHTOP_INDEXER_TOPK_ADAPTER
+                    and decode_topk_v2(logits, row_lens, out, topk_tokens)
+                ):
+                    out.copy_(_topk_indices_torch(
+                        logits, topk_tokens, row_ends=row_lens
+                    ))
+                # Do not retain the previous subchunk's logits while the next
+                # scorer allocates, or carry them into decode in a mixed batch.
+                del logits, row_lens
+            del slots, k_packed, k_scales
 
     if layer.decode is not None and layer.num_decodes > 0:
         decode = layer.decode
@@ -1769,6 +1802,8 @@ def rocm_aiter_sparse_attn_indexer_native(
     candidate_blocks: torch.Tensor | None = None,
     candidate_block_size: int = 0,
     candidate_write: bool = False,
+    fp4_profile_max_decode_tokens: int | None = None,
+    fp4_profile_page_size: int = 0,
 ) -> torch.Tensor:
     # careful! this will be None in dummy run
     fp4_query = q_fp8 if isinstance(q_fp8, Fp4QTuple) else None
@@ -1793,6 +1828,8 @@ def rocm_aiter_sparse_attn_indexer_native(
             candidate_blocks=candidate_blocks,
             candidate_block_size=candidate_block_size,
             candidate_write=candidate_write,
+            fp4_profile_max_decode_tokens=fp4_profile_max_decode_tokens,
+            fp4_profile_page_size=fp4_profile_page_size,
         )
     attn_metadata = get_forward_context().attn_metadata
     packed_fp8_cache = skip_k_cache_insert and kv_cache.dtype == torch.uint8
