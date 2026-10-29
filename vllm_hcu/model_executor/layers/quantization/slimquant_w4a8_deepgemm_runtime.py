@@ -61,29 +61,32 @@ def m_grouped_w4a8_gemm_nt_contiguous_hipc(*args, **kwargs):
 
 
 def fuse_silu_mul_quant(*args, **kwargs):
-    limit = kwargs.pop("limit", None)
-    if limit is not None:
-        # The installed LightOP contiguous INT8 entry rejects limit (only its
-        # FP8 entry fuses it). Clamp GEMM1's BF16 workspace first; both expert
-        # GEMMs and the subsequent INT8 SiLU quantization remain HIPC/LightOP.
-        gateup = args[0]
-        gate, up = gateup.chunk(2, dim=-1)
-        gate.clamp_(max=limit)
-        up.clamp_(min=-limit, max=limit)
     from lightop.activation import fuse_silu_mul_quant as lightop_fuse_silu_mul_quant
 
     return lightop_fuse_silu_mul_quant(*args, **kwargs)
 
 
-def _canonical_weight_signature(layer: torch.nn.Module) -> tuple[object, ...]:
+def _weight_signature(
+    w13: torch.Tensor, w2: torch.Tensor
+) -> tuple[object, ...]:
+    """Identity of a weight pair, used to refresh derived caches on reload."""
+
     return (
-        id(layer.w13_weight),
-        layer.w13_weight._version,
-        tuple(layer.w13_weight.shape),
-        id(layer.w2_weight),
-        layer.w2_weight._version,
-        tuple(layer.w2_weight.shape),
+        id(w13),
+        w13._version,
+        tuple(w13.shape),
+        id(w2),
+        w2._version,
+        tuple(w2.shape),
     )
+
+
+def _canonical_weight_signature(layer: torch.nn.Module) -> tuple[object, ...]:
+    return _weight_signature(layer.w13_weight, layer.w2_weight)
+
+
+def _packed_weight_signature(layer: torch.nn.Module) -> tuple[object, ...]:
+    return _weight_signature(layer.w13_weight_packed, layer.w2_weight_packed)
 
 
 def _validate_w4a8_channel_weights(layer: torch.nn.Module) -> None:
@@ -302,22 +305,35 @@ class DeepEPDeepGemmW4A8ContiguousExperts(TritonExperts):
             m_indices,
         )
         activation_out_dim = self.adjust_N_for_activation(N, activation)
-        quant_output = _resize_cache(
-            workspace13.view(dtype=torch.int8),
-            (m_aligned, activation_out_dim),
-        )
-        activation_kwargs = {}
         clamp_limit = getattr(
             getattr(self, "activation_config", None), "clamp_limit", None
         )
-        if clamp_limit is not None:
-            activation_kwargs["limit"] = clamp_limit
-        q_activation, q_activation_scale = fuse_silu_mul_quant(
-            gateup_output,
-            output=quant_output,
-            expert_ids=m_indices,
-            **activation_kwargs,
-        )
+        if clamp_limit is not None and clamp_limit > 0:
+            # Clamp-aware LightOp activation, same kernel the INT8 DeepGEMM
+            # experts use. The plain ``fuse_silu_mul_quant`` rejects ``limit``.
+            # This variant takes only ``input``/``limit``; it has no
+            # ``expert_ids``/``output`` arguments and allocates its own output,
+            # so no int8 workspace is reserved on this branch.
+            from vllm_hcu.model_executor.layers.fused_moe.experts import (
+                dpsk_v4_deep_gemm_moe,
+            )
+
+            q_activation, q_activation_scale = (
+                dpsk_v4_deep_gemm_moe.fuse_silu_mul_clamp_quant(
+                    gateup_output,
+                    limit=clamp_limit,
+                )
+            )
+        else:
+            quant_output = _resize_cache(
+                workspace13.view(dtype=torch.int8),
+                (m_aligned, activation_out_dim),
+            )
+            q_activation, q_activation_scale = fuse_silu_mul_quant(
+                gateup_output,
+                output=quant_output,
+                expert_ids=m_indices,
+            )
         down_output = _resize_cache(workspace2, (m_aligned, K))
         m_grouped_w4a8_gemm_nt_contiguous_hipc(
             (q_activation, q_activation_scale),
@@ -382,6 +398,35 @@ class DeepEPDeepGemmW4A8BatchedExperts(BatchedDeepGemmExperts):
                 ).detach()
                 masked_w2 = view_w4a8_moe_hipc_weight_n32_layout(
                     packed_w2
+                ).detach()
+            setattr(layer, cache_w13_name, masked_w13)
+            setattr(layer, cache_w2_name, masked_w2)
+            setattr(layer, cache_signature_name, signature)
+
+        self._deepgemm_w13 = getattr(layer, cache_w13_name)
+        self._deepgemm_w2 = getattr(layer, cache_w2_name)
+
+    def adopt_packed_weights(self, layer: torch.nn.Module) -> None:
+        """Derive the masked N32 view from already-packed checkpoint weights.
+
+        The compressed-tensors entry point packs ``w13_weight_packed`` /
+        ``w2_weight_packed`` in place before constructing the experts, so the
+        SlimQuant-named ``w13_weight`` / ``w2_weight`` parameters never exist on
+        that layer. Re-packing them is impossible; the masked kernel only needs
+        the N32-shuffled *view* of the packer output.
+        """
+
+        signature = _packed_weight_signature(layer)
+        cache_signature_name = f"{self._CACHE_PREFIX}_packed_source"
+        cache_w13_name = f"{self._CACHE_PREFIX}_packed_w13"
+        cache_w2_name = f"{self._CACHE_PREFIX}_packed_w2"
+        if getattr(layer, cache_signature_name, None) != signature:
+            with torch.no_grad():
+                masked_w13 = view_w4a8_moe_hipc_weight_n32_layout(
+                    layer.w13_weight_packed
+                ).detach()
+                masked_w2 = view_w4a8_moe_hipc_weight_n32_layout(
+                    layer.w2_weight_packed
                 ).detach()
             setattr(layer, cache_w13_name, masked_w13)
             setattr(layer, cache_w2_name, masked_w2)

@@ -29,6 +29,14 @@ def _require_slimquant_w4a8_hipc_runtime() -> None:
             "fuse_silu_mul_quant",
             "fuse_silu_mul_quant_ep",
         ),
+        # The two clamp-aware activations are exported from lightop's TOP
+        # level, not from ``lightop.activation``. Both W4A8 expert paths use
+        # them whenever the model configures ``swiglu_limit``, so a missing
+        # kernel must fail here rather than deep inside a forward.
+        "lightop": (
+            "fuse_silu_mul_clamp_quant",
+            "fuse_silu_mul_clamp_quant_ep",
+        ),
     }
     missing: list[str] = []
     for module_name, op_names in required_ops.items():

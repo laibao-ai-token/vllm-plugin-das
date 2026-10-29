@@ -63,39 +63,71 @@ def apply_to_module(module: ModuleType) -> bool:
             raise ValueError("HCU CT W4A8 DeepGEMM bring-up currently supports DeepSeek-V4.1 only")
         # Reject unsupported topology before allocating/repacking weights.
         #
-        # Speculative draft models are a legitimate exception to the PCP8 topology
-        # rule. vLLM forces prefill_context_parallel_size=1 on draft models by
-        # design (vllm/v1/worker/gpu/spec_decode/dflash/speculator.py:39-45,
-        # inherited by DSparkSpeculator at dspark/speculator.py:40), because PCP
-        # splits the PREFILL context and a draft model only serves decode-time
-        # speculation. The draft is still W4A8: the checkpoint carries a dedicated
+        # Two deployment shapes are admitted, matching the two roles of the
+        # disaggregated V4.1 topology:
+        #
+        #   P side (prefill):  dp=1, pcp=8, eager
+        #   D side (decode):   dp=8, pcp=1, graphs allowed
+        #
+        # Speculative draft models are a legitimate exception to the PCP8 rule.
+        # vLLM forces prefill_context_parallel_size=1 on draft models by design
+        # (vllm/v1/worker/gpu/spec_decode/dflash/speculator.py:39-45, inherited
+        # by DSparkSpeculator at dspark/speculator.py:40), because PCP splits the
+        # PREFILL context and a draft model only serves decode-time speculation.
+        # The draft is still W4A8: the checkpoint carries a dedicated
         # group_int4_mtp_experts scheme (same INT4 channel weights / INT8 dynamic
-        # token activations as group_int4_routed_experts) and SGLang likewise runs
-        # the draft on deep_gemm (--speculative-moe-runner-backend deep_gemm).
-        # So the draft keeps the same DeepGEMM path, only the PCP expectation differs.
+        # token activations as group_int4_routed_experts) and SGLang likewise
+        # runs the draft on deep_gemm (--speculative-moe-runner-backend deep_gemm).
+        #
+        # dp>1 is admitted because the W4A8 MoE path holds no data-parallel state:
+        # weights, packing and the DeepEP/DeepGEMM experts are EP-scoped only, and
+        # every DP rank runs the identical per-rank code. The FP4 indexer gate
+        # already admits DP1/DP8 (patch_deepseek_v41_indexer_k_layout.py), so the
+        # two contracts now agree.
+        #
+        # eager is required only where PCP forces it. With pcp=1 the decode role
+        # may capture graphs.
         from vllm.compilation import backends as _compile_backends
         is_draft_model = _compile_backends.model_tag != "backbone"
         parallel = config.parallel_config
+        pcp = parallel.prefill_context_parallel_size
+        dp = parallel.data_parallel_size
         reasons = []
-        if parallel.tensor_parallel_size != 1: reasons.append(f"tp={parallel.tensor_parallel_size}")
-        if parallel.pipeline_parallel_size != 1: reasons.append(f"pp={parallel.pipeline_parallel_size}")
-        if parallel.decode_context_parallel_size != 1: reasons.append(f"dcp={parallel.decode_context_parallel_size}")
+        # Real shape/layout constraints: weight packing is TP-local, PP-split and
+        # DCP-unsupported.
+        if parallel.tensor_parallel_size != 1:
+            reasons.append(f"tp={parallel.tensor_parallel_size}")
+        if parallel.pipeline_parallel_size != 1:
+            reasons.append(f"pp={parallel.pipeline_parallel_size}")
+        if parallel.decode_context_parallel_size != 1:
+            reasons.append(f"dcp={parallel.decode_context_parallel_size}")
+        if dp not in (1, 8):
+            reasons.append(f"dp={dp}")
+        # PCP role contract: draft always 1; target PCP8 when DP1 (prefill), and
+        # PCP1 when DP8 (decode).
         if is_draft_model:
-            # vLLM forces pcp=1 for draft models; anything else would mean the
-            # assumption above no longer holds.
-            if parallel.prefill_context_parallel_size != 1:
-                reasons.append(f"draft_pcp={parallel.prefill_context_parallel_size}")
-        elif parallel.prefill_context_parallel_size != 8:
-            reasons.append(f"pcp={parallel.prefill_context_parallel_size}")
-        if parallel.data_parallel_size != 1: reasons.append(f"dp={parallel.data_parallel_size}")
-        if parallel.enable_eplb: reasons.append("eplb=True")
-        if not config.model_config.enforce_eager: reasons.append("enforce_eager=False")
-        if config.lora_config is not None: reasons.append("lora!=None")
+            if pcp != 1:
+                reasons.append(f"draft_pcp={pcp}")
+        elif dp == 1:
+            if pcp != 8:
+                reasons.append(f"pcp={pcp}")
+        elif pcp != 1:
+            reasons.append(f"decode_pcp={pcp}")
+        # EPLB rewrites expert placement after packing, which the resident
+        # packed weights cannot follow.
+        if parallel.enable_eplb:
+            reasons.append("eplb=True")
+        # PCP's virtual-batch layout needs eager; decode-only DP8 does not.
+        if pcp > 1 and not config.model_config.enforce_eager:
+            reasons.append("enforce_eager=False")
+        if config.lora_config is not None:
+            reasons.append("lora!=None")
         if reasons:
             scope = "draft" if is_draft_model else "target"
             raise ValueError(
-                "HCU CT W4A8 bring-up requires eager TP1/DP1/PP1/DCP1 without LoRA/EPLB "
-                f"(target PCP8, draft PCP1); scope={scope}; mismatched: {', '.join(reasons)}"
+                "HCU CT W4A8 supports TP1/PP1/DCP1 without LoRA/EPLB, "
+                "DP1+PCP8+eager (prefill) or DP8+PCP1+graphs (decode); "
+                f"scope={scope}; mismatched: {', '.join(reasons)}"
             )
         from vllm_hcu.model_executor.layers.quantization.compressed_tensors_w4a8_deepgemm import (
             HCUCompressedTensorsW4A8Int8MoEMethod,

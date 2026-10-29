@@ -175,6 +175,103 @@ def test_routing_patch_selects_ct_w4a8_and_delegates_other_schemes(monkeypatch):
         Original.get_moe_method(quant, SimpleNamespace(moe_config=moe), "x")
 
 
+def _topology_routing(monkeypatch, *, tp=1, pp=1, dcp=1, pcp=8, dp=1,
+                      eager=True, eplb=False, lora=None, model_tag="backbone"):
+    """Install the routing patch with a synthetic topology and return the call."""
+    import importlib
+    from types import ModuleType
+    import vllm.compilation.backends as backends
+    import vllm.config
+    import vllm_hcu.deepseek_v4_runtime
+    from vllm_hcu.patch.worker.op_opt import patch_compressed_tensors_moe_w4a8 as patch
+
+    weight, act, moe = _args()
+    module = ModuleType(patch.TARGET_MODULE)
+
+    class Original:
+        @staticmethod
+        def get_moe_method(quant_config, layer, layer_name):
+            return "upstream"
+
+    module.CompressedTensorsMoEMethod = Original
+    module.current_platform = SimpleNamespace(is_rocm=lambda: True)
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=tp, pipeline_parallel_size=pp,
+            decode_context_parallel_size=dcp, prefill_context_parallel_size=pcp,
+            data_parallel_size=dp, enable_eplb=eplb,
+        ),
+        model_config=SimpleNamespace(enforce_eager=eager),
+        lora_config=lora,
+    )
+    monkeypatch.setattr(vllm.config, "get_current_vllm_config", lambda: config)
+    monkeypatch.setattr(
+        vllm_hcu.deepseek_v4_runtime, "model_architectures",
+        lambda _: ("DeepseekV41ForCausalLM",),
+    )
+    monkeypatch.setattr(backends, "model_tag", model_tag, raising=False)
+    # apply_to_module caches its marker on the class; use a fresh module each call.
+    patch = importlib.reload(patch)
+    patch.apply_to_module(module)
+    scheme = {"weights": weight, "input_activations": act, "format": "pack-quantized"}
+    quant = SimpleNamespace(
+        _add_fused_moe_to_target_scheme_map=lambda: None,
+        get_scheme_dict=lambda *args: scheme,
+        _is_dynamic_token_w4a8_int=lambda w, a: w.num_bits == 4,
+    )
+    return lambda: Original.get_moe_method(
+        quant, SimpleNamespace(moe_config=moe), "model.ffn.experts"
+    )
+
+
+def test_topology_gate_admits_prefill_and_decode_roles(monkeypatch):
+    """P side keeps PCP8+eager+DP1; D side admits DP8+PCP1 with graphs."""
+    # Prefill role: unchanged from the original bring-up contract.
+    select = _topology_routing(monkeypatch, dp=1, pcp=8, eager=True)
+    assert isinstance(select(), HCUCompressedTensorsW4A8Int8MoEMethod)
+    # Decode role: DP8, PCP1, CUDA graphs enabled.
+    select = _topology_routing(monkeypatch, dp=8, pcp=1, eager=False)
+    assert isinstance(select(), HCUCompressedTensorsW4A8Int8MoEMethod)
+    # Decode role with eager is still fine.
+    select = _topology_routing(monkeypatch, dp=8, pcp=1, eager=True)
+    assert isinstance(select(), HCUCompressedTensorsW4A8Int8MoEMethod)
+
+
+@pytest.mark.parametrize(
+    "kwargs,match",
+    [
+        # P side must keep PCP8.
+        (dict(dp=1, pcp=4), "pcp=4"),
+        # P side must stay eager: PCP's virtual batch cannot be captured.
+        (dict(dp=1, pcp=8, eager=False), "enforce_eager=False"),
+        # Decode side must not run PCP.
+        (dict(dp=8, pcp=8), "decode_pcp=8"),
+        # Only the two audited DP widths are admitted.
+        (dict(dp=2, pcp=1), "dp=2"),
+        # Real layout constraints stay.
+        (dict(dp=1, pcp=8, tp=2), "tp=2"),
+        (dict(dp=1, pcp=8, pp=2), "pp=2"),
+        (dict(dp=1, pcp=8, dcp=2), "dcp=2"),
+        (dict(dp=8, pcp=1, eplb=True), "eplb=True"),
+        (dict(dp=8, pcp=1, lora=object()), "lora!=None"),
+        # Draft models are always pcp=1 regardless of DP.
+        (dict(dp=8, pcp=2, model_tag="draft"), "draft_pcp=2"),
+    ],
+)
+def test_topology_gate_rejects_unaudited_combinations(monkeypatch, kwargs, match):
+    select = _topology_routing(monkeypatch, **kwargs)
+    with pytest.raises(ValueError, match=match):
+        select()
+
+
+def test_draft_model_admits_pcp1_with_graphs(monkeypatch):
+    """The draft runs DP-size AG-RS a2a with pcp=1; graphs are allowed there."""
+    select = _topology_routing(
+        monkeypatch, dp=8, pcp=1, eager=False, model_tag="draft"
+    )
+    assert isinstance(select(), HCUCompressedTensorsW4A8Int8MoEMethod)
+
+
 def test_postload_packs_once_and_seals_loader(monkeypatch):
     from vllm.model_executor.layers.fused_moe import all2all_utils, modular_kernel as mk
     from vllm_hcu.model_executor.layers.quantization import slimquant_w4a8_deepgemm_runtime as runtime
@@ -195,7 +292,13 @@ def test_postload_packs_once_and_seals_loader(monkeypatch):
         return tensor
     monkeypatch.setattr(runtime, "pack_w4a8_moe_hipc_weight", pack)
     monkeypatch.setattr(runtime, "DeepEPDeepGemmW4A8ContiguousExperts", lambda *args: SimpleNamespace())
-    monkeypatch.setattr(all2all_utils, "maybe_make_prepare_finalize", lambda **kwargs: object())
+    monkeypatch.setattr(
+        all2all_utils,
+        "maybe_make_prepare_finalize",
+        lambda **kwargs: SimpleNamespace(
+            activation_format=mk.FusedMoEActivationFormat.Standard
+        ),
+    )
     monkeypatch.setattr(mk, "FusedMoEKernel", lambda pf, experts: SimpleNamespace(experts=experts))
     method.process_weights_after_loading(layer)
     method.process_weights_after_loading(layer)
@@ -332,3 +435,119 @@ def test_full_hipc_experts_with_clamp_weighted_topk_and_empty_expert(monkeypatch
     assert clamped_values > 0
     relative_l2 = (out.float() - reference).norm() / reference.norm()
     assert float(relative_l2) < 0.02, f"relative L2={float(relative_l2)}"
+
+
+def test_batched_experts_adopt_n32_view_of_packed_weights(monkeypatch):
+    """The masked path must build its N32 view without `w13_weight`.
+
+    The compressed-tensors layer registers only `*_packed`; the SlimQuant
+    post-load hook re-packs `w13_weight` and would raise AttributeError here.
+    """
+    from vllm.model_executor.layers.fused_moe import all2all_utils, modular_kernel as mk
+    from vllm_hcu.model_executor.layers.quantization import (
+        slimquant_w4a8_deepgemm_runtime as runtime,
+    )
+
+    method, layer, _ = _layer()
+    layer._expert_routing_tables = lambda: None
+    layer.w13_weight_packed.data.zero_()
+    layer.w2_weight_packed.data.zero_()
+    layer.w13_weight_scale.data.fill_(2)
+    layer.w2_weight_scale.data.fill_(4)
+
+    adopted = []
+
+    class FakeBatched(runtime.DeepEPDeepGemmW4A8BatchedExperts):
+        def __init__(self, **kwargs):
+            self._deepgemm_w13 = None
+            self._deepgemm_w2 = None
+            adopted.append(self)
+
+        def adopt_packed_weights(self, target):
+            adopted.append(target)
+            self._deepgemm_w13 = target.w13_weight_packed
+            self._deepgemm_w2 = target.w2_weight_packed
+
+    monkeypatch.setattr(runtime, "pack_w4a8_moe_hipc_weight", lambda t: t)
+    monkeypatch.setattr(runtime, "DeepEPDeepGemmW4A8BatchedExperts", FakeBatched)
+    monkeypatch.setattr(
+        all2all_utils,
+        "maybe_make_prepare_finalize",
+        lambda **kwargs: SimpleNamespace(
+            activation_format=mk.FusedMoEActivationFormat.BatchedExperts,
+            max_num_tokens_per_rank=lambda: 128,
+            num_dispatchers=lambda: 1,
+        ),
+    )
+    monkeypatch.setattr(
+        mk, "FusedMoEKernel", lambda pf, experts: SimpleNamespace(experts=experts)
+    )
+
+    method.process_weights_after_loading(layer)
+
+    experts = method.moe_kernel.experts
+    assert isinstance(experts, FakeBatched)
+    assert experts._deepgemm_w13 is layer.w13_weight_packed
+    assert experts._deepgemm_w2 is layer.w2_weight_packed
+
+
+def test_adopt_packed_weights_rejects_missing_packed_parameters():
+    """Guard the contract: the SlimQuant-named parameters must not be required."""
+    from vllm_hcu.model_executor.layers.quantization import (
+        slimquant_w4a8_deepgemm_runtime as runtime,
+    )
+
+    class Layer(torch.nn.Module):
+        pass
+
+    layer = Layer()
+    layer.register_parameter(
+        "w13_weight_packed",
+        torch.nn.Parameter(torch.zeros(2, 512, 64, dtype=torch.int8), requires_grad=False),
+    )
+    layer.register_parameter(
+        "w2_weight_packed",
+        torch.nn.Parameter(torch.zeros(2, 512, 32, dtype=torch.int8), requires_grad=False),
+    )
+    experts = runtime.DeepEPDeepGemmW4A8BatchedExperts.__new__(
+        runtime.DeepEPDeepGemmW4A8BatchedExperts
+    )
+    experts._deepgemm_w13 = None
+    experts._deepgemm_w2 = None
+    experts.adopt_packed_weights(layer)
+    assert experts._deepgemm_w13 is not None
+    assert experts._deepgemm_w2 is not None
+    assert not hasattr(layer, "w13_weight")
+
+
+def test_masked_layout_hook_lives_only_on_the_batched_experts():
+    """The N32 hook must not leak onto the contiguous experts.
+
+    Both classes already own ``process_weights_after_loading`` writing
+    ``_deepgemm_w13`` from a shared cache prefix; if the masked hook were also
+    present on the contiguous class the two would overwrite each other with
+    incompatible layouts.
+    """
+    from vllm_hcu.model_executor.layers.quantization import (
+        slimquant_w4a8_deepgemm_runtime as runtime,
+    )
+
+    batched = runtime.DeepEPDeepGemmW4A8BatchedExperts
+    contiguous = runtime.DeepEPDeepGemmW4A8ContiguousExperts
+    assert hasattr(batched, "adopt_packed_weights")
+    assert not hasattr(contiguous, "adopt_packed_weights")
+    assert not issubclass(contiguous, batched)
+    assert not issubclass(batched, contiguous)
+
+
+def test_masked_layout_cache_keys_do_not_collide_with_contiguous():
+    """Derived-layout caches of the two expert classes stay separate."""
+    from vllm_hcu.model_executor.layers.quantization import (
+        slimquant_w4a8_deepgemm_runtime as runtime,
+    )
+
+    batched_prefix = runtime.DeepEPDeepGemmW4A8BatchedExperts._CACHE_PREFIX
+    contiguous_prefix = runtime.DeepEPDeepGemmW4A8ContiguousExperts._CACHE_PREFIX
+    assert batched_prefix != contiguous_prefix
+    assert not batched_prefix.startswith(contiguous_prefix)
+    assert not contiguous_prefix.startswith(batched_prefix)

@@ -31,13 +31,39 @@ def convert_ct_int4_to_hipc_bytes_(packed: torch.Tensor) -> torch.Tensor:
     return data.view(torch.int8)
 
 
+@functools.lru_cache(maxsize=None)
+def _hipc_implicit_scale_factor() -> float:
+    """The HIPC W4A8 kernel implies 16x on gfx936 only.
+
+    Ported from the hy4-native W4A8 line, where the compensation is gated on
+    the device architecture instead of being applied unconditionally. Keeping
+    the guard here means a different HCU arch fails loudly rather than silently
+    scaling weights by 16.
+
+    Cached: the factor is constant for the life of the process, and this is
+    consulted once per weight-scale tensor on every MoE layer.
+    """
+
+    try:
+        properties = torch.cuda.get_device_properties(
+            torch.cuda.current_device()
+        )
+        arch = str(properties.gcnArchName).split(":", 1)[0]
+    except (AttributeError, AssertionError, RuntimeError):
+        return 1.0
+    return 16.0 if arch == "gfx936" else 1.0
+
+
 def _hipc_channel_scale(scale: torch.Tensor) -> torch.Tensor:
     # HCU kernels read channel scales vectorially. Match the reference guard
     # allocation so the final vector cannot cross a 2 MiB device mapping.
     guard = (2 * 1024 * 1024) // 4
     storage = torch.empty(scale.numel() + guard, dtype=torch.float32, device=scale.device)
     view = storage[:scale.numel()].view(scale.shape)
-    view.copy_(scale).div_(16)
+    factor = _hipc_implicit_scale_factor()
+    view.copy_(scale)
+    if factor != 1.0:
+        view.div_(factor)
     return view
 
 
@@ -59,20 +85,20 @@ def validate_hcu_w4a8(weight_quant, input_quant, moe) -> None:
     ):
         raise ValueError("HCU DeepGEMM W4A8 requires symmetric channel INT4 and dynamic token INT8")
     parallel = moe.moe_parallel_config
-    # The DSpark draft model deliberately runs AG-RS instead of DeepEP HT:
-    # patch_dspark_draft_a2a.py rewrites its all2all backend to
-    # "allgather_reducescatter" so a second DeepEP heap is not allocated, which
-    # mirrors SGLang's speculative a2a=none path (gather DP-local token shards,
-    # run local EP experts, combine). Only the dispatch/combine layer differs;
-    # the expert GEMM stays DeepGEMM, so both backends are accepted here.
+    # Target P uses DeepEP HT; target D uses DeepEP LL.  The expert path
+    # receives the backend-produced token metadata and performs its own
+    # DeepGEMM permutation or masked batched GEMM, so dispatch/combine backend
+    # selection is separate from the packed W4A8 expert GEMM contract. DSpark
+    # draft remains on AG-RS.
     if not parallel.use_ep or parallel.all2all_backend not in (
         "deepep_high_throughput",
+        "deepep_low_latency",
         "allgather_reducescatter",
     ):
         raise ValueError(
             "HCU CT W4A8 requires EP with all2all_backend "
-            f"'deepep_high_throughput' (target) or 'allgather_reducescatter' "
-            f"(draft), got {parallel.all2all_backend!r}"
+            f"'deepep_high_throughput' (P), 'deepep_low_latency' (D), or "
+            f"'allgather_reducescatter' (draft), got {parallel.all2all_backend!r}"
         )
     if moe.moe_backend != "deep_gemm":
         raise ValueError("HCU CT W4A8 requires moe_backend='deep_gemm'")
@@ -166,6 +192,7 @@ class HCUCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
         from vllm.model_executor.layers.fused_moe import modular_kernel as mk
         from vllm.model_executor.layers.fused_moe.all2all_utils import maybe_make_prepare_finalize
         from vllm_hcu.model_executor.layers.quantization.slimquant_w4a8_deepgemm_runtime import (
+            DeepEPDeepGemmW4A8BatchedExperts,
             DeepEPDeepGemmW4A8ContiguousExperts,
             pack_w4a8_moe_hipc_weight,
         )
@@ -184,9 +211,10 @@ class HCUCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
             ):
                 raise RuntimeError("HIPC W4A8 packer must retain packed weight storage and shape")
             replace_parameter(layer, name, packed)
-        # LightOp expands signed nibbles into the high half of INT8. Keep
-        # checkpoint scale Parameters unchanged and use derived /16 scales.
-        self.moe_quant_config = None
+        # LightOp expands signed INT4 nibbles into the high half of INT8, so the
+        # kernel wants the checkpoint scales divided by 16. The checkpoint
+        # scale Parameters stay untouched; ``get_fused_moe_quant_config``
+        # derives the divided copies.
         self.moe_quant_config = self.get_fused_moe_quant_config(layer)
         prepare = maybe_make_prepare_finalize(
             moe=self.moe, quant_config=self.moe_quant_config,
@@ -199,9 +227,33 @@ class HCUCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
                 "HCU CT W4A8 did not construct a prepare/finalize for "
                 f"all2all_backend={self.moe.moe_parallel_config.all2all_backend!r}"
             )
-        experts = DeepEPDeepGemmW4A8ContiguousExperts(self.moe, self.moe_quant_config)
-        experts._deepgemm_w13 = layer.w13_weight_packed
-        experts._deepgemm_w2 = layer.w2_weight_packed
+        if prepare.activation_format == mk.FusedMoEActivationFormat.BatchedExperts:
+            max_tokens = prepare.max_num_tokens_per_rank()
+            if max_tokens is None:
+                raise RuntimeError(
+                    "HCU CT W4A8 low-latency prepare/finalize did not expose "
+                    "max_num_tokens_per_rank"
+                )
+            experts = DeepEPDeepGemmW4A8BatchedExperts(
+                moe_config=self.moe,
+                quant_config=self.moe_quant_config,
+                max_num_tokens=max_tokens,
+                num_dispatchers=prepare.num_dispatchers(),
+            )
+        else:
+            experts = DeepEPDeepGemmW4A8ContiguousExperts(
+                self.moe, self.moe_quant_config
+            )
+            # Contiguous experts consume the packed checkpoint layout directly.
+            experts._deepgemm_w13 = layer.w13_weight_packed
+            experts._deepgemm_w2 = layer.w2_weight_packed
+        if isinstance(experts, DeepEPDeepGemmW4A8BatchedExperts):
+            # The masked HIPC kernel consumes the N32-shuffled view of the
+            # packed weights. Build it from the already-packed checkpoint
+            # parameters: this layer registers only the ``*_packed`` names, so
+            # the SlimQuant post-load hook (which re-packs ``w13_weight``)
+            # cannot be reused here.
+            experts.adopt_packed_weights(layer)
         self.moe_kernel = mk.FusedMoEKernel(prepare, experts)
         self._packed_signature = self._signature(layer)
         self._layout_state = "ready"
