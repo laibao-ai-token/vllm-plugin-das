@@ -22,6 +22,7 @@ _FEATURE_FIELDS = (
     "enable_multi_layers_mtp",
     "enable_dsa_cache_layer_split",
     "deepep_auto",
+    "dspark_draft_all2all_backend",
     "fused_qwen3_rms_rope",
     "qwen4_exp_hc_sp",
     "k3_sp_moe",
@@ -102,6 +103,8 @@ class HcuFeatureConfig:
     enable_multi_layers_mtp: bool = False
     enable_dsa_cache_layer_split: bool = False
     deepep_auto: bool = False
+    # Explicit eager draft policy; never changes the target backend or manager.
+    dspark_draft_all2all_backend: str | None = None
     # Effective (master AND child) runtime policy persisted for compilation
     # cache partitioning. Platform validation refreshes it from the process
     # environment before vLLM computes its config hash.
@@ -138,6 +141,11 @@ class HcuFeatureConfig:
                     f"HCU config field {name!r} must be bool, "
                     f"got {type(value).__name__}"
                 )
+        if self.dspark_draft_all2all_backend not in (None, "allgather_reducescatter"):
+            raise ValueError(
+                "HCU dspark_draft_all2all_backend must be None or "
+                "'allgather_reducescatter'"
+            )
         if not isinstance(self.moe_backend, str):
             raise TypeError(
                 "HCU config field 'moe_backend' must be str, "

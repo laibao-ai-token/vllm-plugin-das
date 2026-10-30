@@ -55,6 +55,7 @@ def test_dict_vllm_config_uses_canonical_storage_path() -> None:
                 "enable_multi_layers_mtp": False,
                 "enable_dsa_cache_layer_split": False,
                 "deepep_auto": False,
+                "dspark_draft_all2all_backend": None,
                 "fused_qwen3_rms_rope": True,
                 "qwen4_exp_hc_sp": True,
                 "k3_sp_moe": False,
@@ -210,3 +211,27 @@ def test_invalid_values_are_rejected(payload: dict[str, object], error: type[Exc
 def test_write_requires_mutable_mapping() -> None:
     with pytest.raises(TypeError, match="mutable mapping"):
         write_hcu_config(({},), HcuFeatureConfig())  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("backend", [None, "allgather_reducescatter"])
+def test_dspark_draft_backend_explicit_storage_roundtrip_and_pickle(backend) -> None:
+    config = SimpleNamespace(additional_config={"unrelated": 7})
+    expected = HcuFeatureConfig(dspark_draft_all2all_backend=backend)
+    normalized = set_hcu_config(config, expected)
+    assert "dspark_draft_all2all_backend" in config.additional_config["hcu"]
+    assert config.additional_config["hcu"]["dspark_draft_all2all_backend"] == backend
+    assert config.additional_config["unrelated"] == 7
+    assert HcuFeatureConfig.from_mapping(expected.to_dict()) == normalized
+    assert pickle.loads(pickle.dumps(expected)) == expected
+    restored = pickle.loads(pickle.dumps(config))
+    assert get_hcu_config(restored) == expected
+    assert get_hcu_config(SimpleNamespace(dspark_draft_all2all_backend=backend)) == expected
+    kwargs = {"dspark_draft_all2all_backend": backend, "model": "unchanged"}
+    assert pop_hcu_feature_kwargs(kwargs) == expected
+    assert kwargs == {"model": "unchanged"}
+
+
+@pytest.mark.parametrize("backend", ["deepep_low_latency", "deepep_auto", "", 1, True, False, {}, []])
+def test_dspark_draft_backend_invalid_values_preserve_strict_validation(backend) -> None:
+    with pytest.raises(ValueError, match="dspark_draft_all2all_backend"):
+        HcuFeatureConfig.from_mapping({"dspark_draft_all2all_backend": backend})
