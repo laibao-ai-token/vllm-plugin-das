@@ -41,6 +41,60 @@ def _hipc_channel_scale(scale: torch.Tensor) -> torch.Tensor:
     return view
 
 
+def _draft_all2all_manager(moe):
+    # The producer is optional until its separately reviewed slice is applied.
+    # Only absence of this exact module means target/default ownership.
+    try:
+        from vllm_hcu.dspark_runtime import get_dspark_all2all_manager
+    except ModuleNotFoundError as exc:
+        if exc.name != "vllm_hcu.dspark_runtime":
+            raise
+        if getattr(moe, "_hcu_dspark_all2all_manager", None) is not None:
+            raise RuntimeError("DSpark manager is bound but its producer API is unavailable") from exc
+        return None
+    manager = get_dspark_all2all_manager(moe)
+    if manager is None:
+        return None
+    parallel = moe.moe_parallel_config
+    if parallel.all2all_backend != "allgather_reducescatter":
+        raise RuntimeError("DSpark draft manager cannot own fixed target DeepEP experts")
+    if (
+        manager.world_size != parallel.ep_size
+        or manager.dp_world_size != parallel.dp_size
+    ):
+        raise RuntimeError("DSpark manager does not match the loaded MoE DP/EP membership")
+    return manager
+
+
+def _draft_token_capacity(moe, manager, stored=None):
+    if manager is None:
+        if stored is not None:
+            raise RuntimeError("DSpark capacity lost its bound draft manager")
+        return None
+    from vllm_hcu.dspark_runtime import get_dspark_token_capacity
+
+    active = get_dspark_token_capacity()
+    capacity = active if active is not None else stored
+    if capacity is None:
+        raise RuntimeError("DSpark manager has no active or consumer-bound token capacity")
+    if stored is not None and active is not None and active != stored:
+        raise RuntimeError("DSpark token capacity changed after MoE construction")
+    fields = (
+        capacity.speculative_tokens, capacity.max_requests,
+        capacity.query_tokens_per_request, capacity.query_tokens_per_rank,
+        capacity.verify_tokens_per_rank, capacity.capacity_per_rank,
+    )
+    if any(type(value) is not int or value <= 0 for value in fields):
+        raise RuntimeError("DSpark producer returned an invalid token capacity contract")
+    declared = getattr(moe, "max_num_tokens", None)
+    if (
+        type(declared) is not int or declared != capacity.capacity_per_rank
+        or max(capacity.query_tokens_per_rank, capacity.verify_tokens_per_rank) > declared
+    ):
+        raise RuntimeError("DSpark producer token bounds do not match the loaded MoE capacity")
+    return capacity
+
+
 def validate_hcu_w4a8(weight_quant, input_quant, moe) -> None:
     """Fail closed outside channel-W4A8 with a fixed HT/LL or explicit AG-RS path."""
     if not (
@@ -97,6 +151,8 @@ class HCUCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
         self.weight_quant = weight_quant
         self.input_quant = input_quant
         self._layout_state: str | None = None
+        self._ll_token_capacity: int | None = None
+        self._dspark_token_capacity = None
 
     @property
     def is_monolithic(self) -> bool:
@@ -158,6 +214,10 @@ class HCUCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
     def process_weights_after_loading(self, layer):
         if self._layout_state == "ready":
             if self._signature(layer) == self._packed_signature:
+                manager = _draft_all2all_manager(self.moe)
+                if manager is not self._construction_manager:
+                    raise RuntimeError("HCU CT W4A8 manager ownership changed after kernel construction")
+                _draft_token_capacity(self.moe, manager, self._dspark_token_capacity)
                 return
             raise RuntimeError("HCU CT W4A8 weight reload is not supported; restart worker")
         if self._layout_state is not None:
@@ -170,6 +230,18 @@ class HCUCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
             pack_w4a8_moe_hipc_weight,
             view_w4a8_moe_hipc_weight_n32_layout,
         )
+
+        manager = _draft_all2all_manager(self.moe)
+        draft_capacity = _draft_token_capacity(self.moe, manager)
+        fixed_ll = self.moe.moe_parallel_config.all2all_backend == "deepep_low_latency"
+        if fixed_ll:
+            declared_capacity = getattr(self.moe, "max_num_tokens", None)
+            expected_dispatchers = getattr(self.moe.moe_parallel_config, "ep_size", None)
+            if (
+                type(declared_capacity) is not int or declared_capacity <= 0
+                or type(expected_dispatchers) is not int or expected_dispatchers <= 0
+            ):
+                raise RuntimeError("HCU CT W4A8 LL requires declared MoE capacity and EP size")
 
         # Convert one projection at a time; retain ONE resident weight owner.
         # General SlimQuant post-load clones both, doubling resident weights.
@@ -193,6 +265,9 @@ class HCUCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
             moe=self.moe, quant_config=self.moe_quant_config,
             routing_tables=layer._expert_routing_tables(),
             allow_new_interface=True, use_monolithic=False,
+            all2all_manager=manager,
+            # These experts consume quantized inputs, with no deferred dtype override.
+            input_dtype=None,
         )
         if prepare is None:
             # Fixed DeepEP HT/LL or naive AG-RS (DSpark draft) prepare/finalize.
@@ -200,7 +275,7 @@ class HCUCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
                 "HCU CT W4A8 did not construct a prepare/finalize for "
                 f"all2all_backend={self.moe.moe_parallel_config.all2all_backend!r}"
             )
-        if self.moe.moe_parallel_config.all2all_backend == "deepep_low_latency":
+        if fixed_ll:
             from vllm.model_executor.layers.fused_moe.prepare_finalize.deepep_ll import (
                 DeepEPLLPrepareAndFinalize,
             )
@@ -221,6 +296,11 @@ class HCUCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
                 or type(dispatchers) is not int or dispatchers <= 0
             ):
                 raise RuntimeError("HCU CT W4A8 LL requires positive token capacity and dispatchers")
+            if capacity != declared_capacity or dispatchers != expected_dispatchers:
+                raise RuntimeError(
+                    "HCU CT W4A8 LL prepare/finalize capacity or dispatchers "
+                    "does not match the loaded MoE config"
+                )
             experts = DeepEPDeepGemmW4A8BatchedExperts(
                 self.moe, self.moe_quant_config, capacity, dispatchers,
             )
@@ -240,17 +320,25 @@ class HCUCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
             ):
                 raise RuntimeError("HCU CT W4A8 LL N32 views must alias packed weight storage")
             experts._deepgemm_w13, experts._deepgemm_w2 = views
+            self._ll_token_capacity = capacity
         else:
             experts = DeepEPDeepGemmW4A8ContiguousExperts(self.moe, self.moe_quant_config)
             experts._deepgemm_w13 = layer.w13_weight_packed
             experts._deepgemm_w2 = layer.w2_weight_packed
         self.moe_kernel = mk.FusedMoEKernel(prepare, experts)
+        # None is an ownership choice too; a ready kernel cannot adopt a scope.
+        self._construction_manager = manager
+        if manager is not None:
+            self._dspark_token_capacity = draft_capacity
+            self.moe._hcu_dspark_all2all_manager = manager
         self._packed_signature = self._signature(layer)
         self._layout_state = "ready"
 
     def apply(self, layer, x, topk_weights, topk_ids, shared_experts, shared_experts_input):
         if self._layout_state != "ready" or self.moe_kernel is None:
             raise RuntimeError("HCU CT W4A8 weights must be packed before forward")
+        if self._ll_token_capacity is not None and x.size(0) > self._ll_token_capacity:
+            raise ValueError("HCU CT W4A8 LL forward exceeds checked token capacity per rank")
         return self.moe_kernel.apply(
             hidden_states=x,
             w1=layer.w13_weight_packed, w2=layer.w2_weight_packed,

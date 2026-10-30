@@ -337,3 +337,163 @@ def test_full_hipc_experts_with_clamp_weighted_topk_and_empty_expert(monkeypatch
     assert clamped_values > 0
     relative_l2 = (out.float() - reference).norm() / reference.norm()
     assert float(relative_l2) < 0.02, f"relative L2={float(relative_l2)}"
+
+
+@pytest.mark.parametrize("drift", [None, "capacity", "dispatchers"])
+def test_ll_postload_capacity_dispatchers_and_forward_limit(monkeypatch, drift):
+    """CPU boundary contract; no proprietary pack/GEMM/dispatch is executed."""
+    import sys
+    from types import ModuleType
+    from vllm.model_executor.layers.fused_moe import all2all_utils, modular_kernel as mk
+    from vllm_hcu.model_executor.layers.quantization import slimquant_w4a8_deepgemm_runtime as runtime
+
+    weight, activation, moe = _args()
+    moe.moe_parallel_config.all2all_backend = "deepep_low_latency"
+    moe.moe_parallel_config.ep_size = 8
+    moe.max_num_tokens = 4
+    method = HCUCompressedTensorsW4A8Int8MoEMethod(weight, activation, moe)
+    layer = torch.nn.Module()
+    method.create_weights(layer, 2, 512, 256, torch.bfloat16)
+    layer._expert_routing_tables = lambda: None
+    layer.w13_weight_packed.data.zero_()
+    layer.w2_weight_packed.data.zero_()
+    layer.w13_weight_scale.data.fill_(1)
+    layer.w2_weight_scale.data.fill_(1)
+    layer.activation, layer.global_num_experts = "silu", 16
+    layer.expert_map, layer.apply_router_weight_on_input = None, False
+
+    class LL:
+        use_int8_dispatch = True
+        use_fp8_dispatch = False
+        def max_num_tokens_per_rank(self):
+            return 3 if drift == "capacity" else 4
+        def num_dispatchers(self):
+            return 7 if drift == "dispatchers" else 8
+    ll_module = ModuleType("vllm.model_executor.layers.fused_moe.prepare_finalize.deepep_ll")
+    ll_module.DeepEPLLPrepareAndFinalize = LL
+    monkeypatch.setitem(sys.modules, ll_module.__name__, ll_module)
+    producer = ModuleType("vllm_hcu.dspark_runtime")
+    producer.get_dspark_all2all_manager = lambda config: None
+    monkeypatch.setitem(sys.modules, producer.__name__, producer)
+    def factory(moe, quant_config, routing_tables=None, allow_new_interface=False,
+                use_monolithic=False, all2all_manager=None, input_dtype=None):
+        assert all2all_manager is None and input_dtype is None
+        return LL()
+    monkeypatch.setattr(all2all_utils, "maybe_make_prepare_finalize", factory)
+    monkeypatch.setattr(runtime, "pack_w4a8_moe_hipc_weight", lambda value: value)
+    monkeypatch.setattr(runtime, "view_w4a8_moe_hipc_weight_n32_layout",
+                        lambda w: w.view(w.size(0), w.size(2)//32, w.size(1)//32, 4, 32, 8))
+    monkeypatch.setattr(runtime, "DeepEPDeepGemmW4A8BatchedExperts", lambda *args: SimpleNamespace())
+    calls = []
+    def forward(**kwargs):
+        calls.append(kwargs["hidden_states"].size(0))
+        return kwargs["hidden_states"]
+    monkeypatch.setattr(mk, "FusedMoEKernel", lambda pf, experts: SimpleNamespace(apply=forward))
+    if drift is not None:
+        with pytest.raises(RuntimeError, match="does not match the loaded MoE config"):
+            method.process_weights_after_loading(layer)
+        assert calls == []
+        return
+    method.process_weights_after_loading(layer)
+    for rows in (0, 4):
+        method.apply(layer, torch.zeros((rows, 512), dtype=torch.bfloat16),
+                     torch.ones((rows, 1)), torch.zeros((rows, 1), dtype=torch.int64), None, None)
+    with pytest.raises(ValueError, match="exceeds checked token capacity"):
+        method.apply(layer, torch.zeros((5, 512), dtype=torch.bfloat16),
+                     torch.ones((5, 1)), torch.zeros((5, 1), dtype=torch.int64), None, None)
+    assert calls == [0, 4]
+
+
+@pytest.mark.parametrize("draft,graph", [(False, False), (True, False), (False, True), (True, True)])
+def test_decode_and_draft_dp8_remain_gated_without_reviewed_common_contract(draft, graph):
+    from vllm_hcu.patch.worker.op_opt import patch_compressed_tensors_moe_w4a8 as routing
+    _, _, moe = _args()
+    moe.moe_parallel_config.all2all_backend = "allgather_reducescatter" if draft else "deepep_low_latency"
+    moe.moe_parallel_config.tp_size = moe.moe_parallel_config.pcp_size = 1
+    moe.moe_parallel_config.dp_size = moe.moe_parallel_config.ep_size = 8
+    moe.max_num_tokens = 256
+    # A private field is not sufficient evidence to enable a topology.
+    moe._hcu_dspark_all2all_manager = object()
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(tensor_parallel_size=1, pipeline_parallel_size=1,
+            decode_context_parallel_size=1, prefill_context_parallel_size=1,
+            data_parallel_size=8, enable_eplb=False),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=256),
+        model_config=SimpleNamespace(enforce_eager=not graph), lora_config=None,
+    )
+    reason = "graph_contract=unverified" if graph else (
+        "draft_group_capacity_contract=unverified" if draft else "decode_common_contract=unverified")
+    if draft and graph:
+        config.model_config.enforce_eager = True
+        config.speculative_config = SimpleNamespace(draft_model_config=SimpleNamespace(enforce_eager=False))
+        reason = "draft_graph_contract=unverified"
+    with pytest.raises(ValueError, match=reason):
+        routing._validate_topology(config, moe, draft)
+
+
+@pytest.mark.parametrize("activate_draft", [False, True])
+def test_ready_postload_keeps_original_none_manager(monkeypatch, activate_draft):
+    """A ready default-owned kernel must not silently accept a draft scope."""
+    import sys
+    from types import ModuleType
+    from vllm.model_executor.layers.fused_moe import all2all_utils, modular_kernel as mk
+    from vllm_hcu.model_executor.layers.quantization import slimquant_w4a8_deepgemm_runtime as runtime
+
+    weight, activation, moe = _args()
+    moe.moe_parallel_config.all2all_backend = "allgather_reducescatter"
+    moe.moe_parallel_config.ep_size = moe.moe_parallel_config.dp_size = 8
+    moe.max_num_tokens = 4
+    method = HCUCompressedTensorsW4A8Int8MoEMethod(weight, activation, moe)
+    layer = torch.nn.Module()
+    writes, factory_calls = [], []
+    method.create_weights(layer, 2, 512, 256, torch.bfloat16,
+                          weight_loader=lambda *a, **kw: writes.append(a))
+    layer._expert_routing_tables = lambda: None
+    layer.w13_weight_packed.data.zero_()
+    layer.w2_weight_packed.data.zero_()
+    layer.w13_weight_scale.data.fill_(1)
+    layer.w2_weight_scale.data.fill_(1)
+    state = {"manager": None}
+    capacity = SimpleNamespace(speculative_tokens=1, max_requests=1,
+        query_tokens_per_request=1, query_tokens_per_rank=1,
+        verify_tokens_per_rank=2, capacity_per_rank=4)
+    producer = ModuleType("vllm_hcu.dspark_runtime")
+    producer.get_dspark_all2all_manager = lambda config: state["manager"]
+    producer.get_dspark_token_capacity = lambda: capacity if state["manager"] is not None else None
+    monkeypatch.setitem(sys.modules, producer.__name__, producer)
+    def factory(moe, quant_config, routing_tables=None, allow_new_interface=False,
+                use_monolithic=False, all2all_manager=None, input_dtype=None):
+        factory_calls.append((all2all_manager, input_dtype))
+        return SimpleNamespace(manager=all2all_manager)
+    monkeypatch.setattr(all2all_utils, "maybe_make_prepare_finalize", factory)
+    monkeypatch.setattr(runtime, "pack_w4a8_moe_hipc_weight", lambda value: value)
+    monkeypatch.setattr(runtime, "DeepEPDeepGemmW4A8ContiguousExperts", lambda *args: SimpleNamespace())
+    monkeypatch.setattr(mk, "FusedMoEKernel", lambda pf, experts: SimpleNamespace(prepare_finalize=pf, experts=experts))
+    method.process_weights_after_loading(layer)
+    kernel, signature, quant = method.moe_kernel, method._packed_signature, method.moe_quant_config
+    parameters = [(name, param, param.data_ptr(), param._version,
+                   getattr(param, "weight_loader", None), param.detach().clone())
+                  for name, param in layer.named_parameters()]
+    assert hasattr(method, "_construction_manager") and method._construction_manager is None
+    if activate_draft:
+        state["manager"] = SimpleNamespace(world_size=8, dp_world_size=8)
+        with pytest.raises(RuntimeError, match="ownership changed after kernel construction"):
+            method.process_weights_after_loading(layer)
+    else:
+        method.process_weights_after_loading(layer)
+    assert method.moe_kernel is kernel and kernel.prepare_finalize.manager is None
+    assert method._construction_manager is None and method._dspark_token_capacity is None
+    assert not hasattr(moe, "_hcu_dspark_all2all_manager")
+    assert method._layout_state == "ready" and method._packed_signature == signature
+    assert method.moe_quant_config is quant and factory_calls == [(None, None)]
+    sealed_loaders = 0
+    for name, owner, ptr, version, loader, values in parameters:
+        current = layer.get_parameter(name)
+        assert current is owner and current.data_ptr() == ptr and current._version == version
+        assert getattr(current, "weight_loader", None) is loader
+        torch.testing.assert_close(current, values, rtol=0, atol=0)
+        if callable(loader):
+            sealed_loaders += 1
+            with pytest.raises(RuntimeError, match="hot reload"):
+                loader(current, torch.tensor(0))
+    assert sealed_loaders and writes == []

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-"""Route channel compressed-tensors W4A8 to fixed-HT HCU DeepGEMM."""
+"""Route CT W4A8 with explicit prefill/draft gates and decode diagnostics."""
 from __future__ import annotations
 
 import functools
@@ -21,6 +21,59 @@ TARGET_MODULE = (
 PATCH_ID = "worker.op_opt.compressed_tensors.moe_w4a8_deepgemm"
 TARGETS = (f"{TARGET_MODULE}.CompressedTensorsMoEMethod.get_moe_method",)
 _MARKER = "_vllm_hcu_ct_w4a8_deepgemm"
+
+
+def _validate_topology(config, moe, is_draft_model):
+    parallel = config.parallel_config
+    scope = "draft" if is_draft_model else "prefill"
+    if not is_draft_model and (
+        parallel.prefill_context_parallel_size, parallel.data_parallel_size
+    ) == (1, 8):
+        scope = "decode"
+    reasons = []
+    if parallel.tensor_parallel_size != 1: reasons.append(f"tp={parallel.tensor_parallel_size}")
+    if parallel.pipeline_parallel_size != 1: reasons.append(f"pp={parallel.pipeline_parallel_size}")
+    if parallel.decode_context_parallel_size != 1: reasons.append(f"dcp={parallel.decode_context_parallel_size}")
+    backend = moe.moe_parallel_config.all2all_backend
+    if scope == "decode":
+        if not moe.moe_parallel_config.use_ep or backend != "deepep_low_latency":
+            reasons.append("decode_requires_fixed_ll_ep")
+        budget = config.scheduler_config.max_num_batched_tokens
+        declared = getattr(moe, "max_num_tokens", None)
+        if (type(budget) is not int or budget <= 0
+                or type(declared) is not int or declared != budget):
+            reasons.append("moe_capacity_must_match_scheduler")
+        actual_parallel = moe.moe_parallel_config
+        for name, expected in (("tp_size", 1), ("pcp_size", 1), ("dp_size", 8), ("ep_size", 8)):
+            if getattr(actual_parallel, name, None) != expected:
+                reasons.append(f"moe_{name}_mismatch")
+        # The common producer is a separate, unlanded slice. Its API/field
+        # existing in a candidate is not deployment evidence or an enable flag.
+        reasons.append("decode_common_contract=unverified")
+    else:
+        expected_pcp = 1 if is_draft_model else 8
+        if parallel.prefill_context_parallel_size != expected_pcp:
+            reasons.append(f"pcp={parallel.prefill_context_parallel_size}")
+        if parallel.data_parallel_size != 1:
+            reasons.append(f"dp={parallel.data_parallel_size}")
+            if is_draft_model:
+                reasons.append("draft_group_capacity_contract=unverified")
+        if backend not in ("deepep_high_throughput", "allgather_reducescatter"):
+            reasons.append("prefill_or_draft_requires_contiguous_backend")
+    if parallel.enable_eplb: reasons.append("eplb=True")
+    if not config.model_config.enforce_eager:
+        reasons.append("enforce_eager=False; graph_contract=unverified")
+    if is_draft_model:
+        spec = getattr(config, "speculative_config", None)
+        draft_model = getattr(spec, "draft_model_config", None)
+        if draft_model is not None and not draft_model.enforce_eager:
+            reasons.append("draft_graph_contract=unverified")
+    if config.lora_config is not None: reasons.append("lora!=None")
+    if reasons:
+        raise ValueError(
+            "HCU CT W4A8 topology contract rejected; "
+            f"scope={scope}; mismatched: {', '.join(reasons)}"
+        )
 
 
 def apply_to_module(module: ModuleType) -> bool:
@@ -65,42 +118,11 @@ def apply_to_module(module: ModuleType) -> bool:
         config = get_current_vllm_config()
         if "DeepseekV41ForCausalLM" not in model_architectures(config):
             raise ValueError("HCU CT W4A8 DeepGEMM bring-up currently supports DeepSeek-V4.1 only")
-        # Reject unsupported topology before allocating/repacking weights.
-        #
-        # Speculative draft models are a legitimate exception to the PCP8 topology
-        # rule. vLLM forces prefill_context_parallel_size=1 on draft models by
-        # design (vllm/v1/worker/gpu/spec_decode/dflash/speculator.py:39-45,
-        # inherited by DSparkSpeculator at dspark/speculator.py:40), because PCP
-        # splits the PREFILL context and a draft model only serves decode-time
-        # speculation. The draft is still W4A8: the checkpoint carries a dedicated
-        # group_int4_mtp_experts scheme (same INT4 channel weights / INT8 dynamic
-        # token activations as group_int4_routed_experts) and SGLang likewise runs
-        # the draft on deep_gemm (--speculative-moe-runner-backend deep_gemm).
-        # So the draft keeps the same DeepGEMM path, only the PCP expectation differs.
+        # Native DFlash/DSpark draft construction sets PCP1. It does not by
+        # itself establish draft DP/EP ownership or make graph execution safe.
         from vllm.compilation import backends as _compile_backends
         is_draft_model = _compile_backends.model_tag != "backbone"
-        parallel = config.parallel_config
-        reasons = []
-        if parallel.tensor_parallel_size != 1: reasons.append(f"tp={parallel.tensor_parallel_size}")
-        if parallel.pipeline_parallel_size != 1: reasons.append(f"pp={parallel.pipeline_parallel_size}")
-        if parallel.decode_context_parallel_size != 1: reasons.append(f"dcp={parallel.decode_context_parallel_size}")
-        if is_draft_model:
-            # vLLM forces pcp=1 for draft models; anything else would mean the
-            # assumption above no longer holds.
-            if parallel.prefill_context_parallel_size != 1:
-                reasons.append(f"draft_pcp={parallel.prefill_context_parallel_size}")
-        elif parallel.prefill_context_parallel_size != 8:
-            reasons.append(f"pcp={parallel.prefill_context_parallel_size}")
-        if parallel.data_parallel_size != 1: reasons.append(f"dp={parallel.data_parallel_size}")
-        if parallel.enable_eplb: reasons.append("eplb=True")
-        if not config.model_config.enforce_eager: reasons.append("enforce_eager=False")
-        if config.lora_config is not None: reasons.append("lora!=None")
-        if reasons:
-            scope = "draft" if is_draft_model else "target"
-            raise ValueError(
-                "HCU CT W4A8 bring-up requires eager TP1/DP1/PP1/DCP1 without LoRA/EPLB "
-                f"(target PCP8, draft PCP1); scope={scope}; mismatched: {', '.join(reasons)}"
-            )
+        _validate_topology(config, layer.moe_config, is_draft_model)
         from vllm_hcu.model_executor.layers.quantization.compressed_tensors_w4a8_deepgemm import (
             HCUCompressedTensorsW4A8Int8MoEMethod,
         )
