@@ -474,11 +474,14 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
             self._hsl_record(input_batch, out[2])
         return out
 
-    def prepare_inputs(self, scheduler_output, batch_req_state, batch_desc):
+    def prepare_inputs(
+        self, scheduler_output, batch_req_state, batch_desc, num_active_loras: int
+    ):
         input_batch = super().prepare_inputs(
             scheduler_output,
             batch_req_state,
             batch_desc,
+            num_active_loras,
         )
         if self._hsl_enabled:
             # The mirror is resolved lazily in model_state.prepare_attn (see
@@ -522,7 +525,7 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
                 return execute_model(self, *args, **kwargs)
             return super().execute_model(*args, **kwargs)
 
-    def profile_run(self) -> None:
+    def profile_run(self, randomize_inputs: bool = False) -> None:
         """Profile PCP target locally; profile MTP at the full global batch.
 
         Target prefill is PCP-partitioned, so its MoE/attention workspaces must
@@ -535,7 +538,7 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
         # GLM5Next KDA/K-pool and DeepSeek V4 attention see the full,
         # replicated token batch, including during profiling.
         if pcp_size <= 1 or _uses_global_pcp_batch(self.vllm_config):
-            return super().profile_run()
+            return super().profile_run(randomize_inputs=randomize_inputs)
 
         original_max = self.max_num_tokens
         # Prefill tokens are partitioned, but decode tokens are replicated on
@@ -560,7 +563,7 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
         if speculator is not None:
             self.speculator = None
         try:
-            super().profile_run()
+            super().profile_run(randomize_inputs=randomize_inputs)
         finally:
             if speculator is not None:
                 self.speculator = speculator
@@ -575,7 +578,7 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
         self.max_num_tokens = original_max
         self._hcu_profile_mtp_full_batch = True
         try:
-            super().profile_run()
+            super().profile_run(randomize_inputs=randomize_inputs)
         finally:
             self._hcu_profile_mtp_full_batch = False
             self.max_num_tokens = original_max

@@ -11,6 +11,7 @@ import inspect
 import sys
 import textwrap
 from dataclasses import dataclass
+from functools import wraps
 from types import FunctionType, MethodType, ModuleType, SimpleNamespace
 from typing import NamedTuple
 
@@ -74,6 +75,7 @@ def pcp_runner_module(monkeypatch: pytest.MonkeyPatch):
             self.req_states = object()
             self.execute_model_state = None
             self.pcp_manager = None
+            self.expected_randomize_inputs = False
 
         def initialize_kv_cache(
             self,
@@ -104,10 +106,14 @@ def pcp_runner_module(monkeypatch: pytest.MonkeyPatch):
                     cp_interleave=1,
                 )
 
-        def prepare_inputs(self, scheduler_output, batch_req_state, batch_desc):
+        def prepare_inputs(
+            self, scheduler_output, batch_req_state, batch_desc, num_active_loras: int
+        ):
             events.append("super.prepare_inputs")
             assert scheduler_output == "scheduler-output"
             assert batch_req_state == "batch-req-state"
+            assert num_active_loras == self.expected_num_active_loras
+            assert type(num_active_loras) is int
             input_batch = self.global_batch
             if getattr(self, "pcp_manager", None) is not None:
                 return self.pcp_manager.partition_batch(
@@ -212,8 +218,10 @@ class _MTPExecuteModelState(NamedTuple):
     finished_req_ids: object
 
 
+@pytest.mark.parametrize("num_active_loras", [0, 7])
 def test_pcp_runner_orders_lifecycle_and_restores_sampling_state(
     pcp_runner_module,
+    num_active_loras: int,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Current upstream owns ordinary PCP sampling restore exactly once."""
@@ -271,6 +279,7 @@ def test_pcp_runner_orders_lifecycle_and_restores_sampling_state(
     runner = runner_module.HcuGPUModelRunnerV2(_config(2), "hcu:0")
     assert runner.pcp_manager is None
     runner.global_batch = global_batch
+    runner.expected_num_active_loras = num_active_loras
     events.clear()
 
     runner.initialize_kv_cache(SimpleNamespace(kv_cache_groups=[object()]))
@@ -279,6 +288,7 @@ def test_pcp_runner_orders_lifecycle_and_restores_sampling_state(
         "scheduler-output",
         "batch-req-state",
         SimpleNamespace(num_tokens=17),
+        num_active_loras,
     )
     assert prepared is local_batch
     assert runner.prepare_attn(prepared) == ("local-blocks", "gathered-slots")
@@ -661,8 +671,10 @@ def test_pcp_runner_routes_dummy_slots_through_manager(
     ]
 
 
+@pytest.mark.parametrize("num_active_loras", [0, 7])
 def test_pcp_one_preserves_the_existing_runner_event_path(
     pcp_runner_module,
+    num_active_loras: int,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """PCP=1 must not call a manager helper or bypass an upstream method."""
@@ -685,6 +697,7 @@ def test_pcp_one_preserves_the_existing_runner_event_path(
     runner = runner_module.HcuGPUModelRunnerV2(_config(1), "hcu:0")
     assert runner.pcp_manager is None
     runner.global_batch = global_batch
+    runner.expected_num_active_loras = num_active_loras
     events.clear()
 
     allocation_context = object()
@@ -699,6 +712,7 @@ def test_pcp_one_preserves_the_existing_runner_event_path(
             "scheduler-output",
             "batch-req-state",
             SimpleNamespace(num_tokens=17),
+            num_active_loras,
         )
         is global_batch
     )
@@ -1248,12 +1262,26 @@ def test_pcp_default_model_state_rejects_signature_drift() -> None:
         adapter.apply_to_module(target)
 
 
+def _assert_profile_keyword(method):
+    """Require the runner's explicit keyword, including the False default."""
+
+    @wraps(method)
+    def checked(self, *args, **kwargs):
+        assert args == ()
+        assert set(kwargs) == {"randomize_inputs"}
+        return method(self, **kwargs)
+
+    return checked
+
+
 def _install_recording_profile_run(
     runner_module: ModuleType, seen: list[int]
 ) -> None:
     """Record the token budget observed by the real HCU runner override."""
 
-    def profile_run(self):
+    @_assert_profile_keyword
+    def profile_run(self, *, randomize_inputs: bool = False):
+        assert randomize_inputs is self.expected_randomize_inputs
         seen.append(int(self.max_num_tokens))
 
     runner_module.GPUModelRunner.profile_run = profile_run
@@ -1278,20 +1306,23 @@ def test_profile_run_adds_slack_to_pcp_partitioned_token_budget(
     assert runner.max_num_tokens == 16384
 
 
+@pytest.mark.parametrize("randomize_inputs", [False, True])
 def test_profile_run_keeps_global_budget_for_real_mtp_prefill(
     pcp_runner_module,
+    randomize_inputs: bool,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """PCP target shrinks; MTP propose/prefill keeps the full global batch."""
 
     runner_module, _ = pcp_runner_module
     speculator_module = importlib.import_module(
-        "vllm.v1.worker.gpu.spec_decode.autoregressive.speculator"
+        "vllm.v1.worker.gpu.spec_decode.target_dependent_ar.speculator"
     )
     prefill_tokens: list[int] = []
     target_profile_tokens: list[int] = []
+    profile_keywords: list[bool] = []
 
-    class ConcreteSpeculator(speculator_module.AutoRegressiveSpeculator):
+    class ConcreteSpeculator(speculator_module.TargetDependentARSpeculator):
         def load_draft_model(self, target_model):
             raise NotImplementedError
 
@@ -1304,6 +1335,7 @@ def test_profile_run_keeps_global_budget_for_real_mtp_prefill(
     speculator.current_draft_step = torch.tensor(0, dtype=torch.int64)
     speculator.input_buffers = object()
     speculator.prefill_cudagraph_manager = None
+    speculator.pcp_manager = None
     speculator.dp_size = 1
     speculator.dp_rank = 0
     speculator.draft_tokens = torch.zeros((16, 1), dtype=torch.int64)
@@ -1349,7 +1381,10 @@ def test_profile_run_keeps_global_budget_for_real_mtp_prefill(
         dispatch_prefill,
     )
 
-    def profile_run(self):
+    @_assert_profile_keyword
+    def profile_run(self, *, randomize_inputs: bool = False):
+        assert randomize_inputs is self.expected_randomize_inputs
+        profile_keywords.append(randomize_inputs)
         num_tokens = int(self.max_num_tokens)
         # Pass 1: target-only profile under the PCP-local budget.
         if getattr(self, "speculator", None) is None:
@@ -1372,6 +1407,7 @@ def test_profile_run_keeps_global_budget_for_real_mtp_prefill(
             ),
             idx_mapping=torch.arange(num_reqs, dtype=torch.int64),
             has_prefill=True,
+            decode_graph_eligible=False,
         )
         self.speculator.propose(
             input_batch=input_batch,
@@ -1399,9 +1435,11 @@ def test_profile_run_keeps_global_budget_for_real_mtp_prefill(
     runner.max_num_reqs = 16
     runner.decode_query_len = 3
     runner.speculator = speculator
+    runner.expected_randomize_inputs = randomize_inputs
 
-    runner.profile_run()
+    runner.profile_run(randomize_inputs=randomize_inputs)
 
+    assert profile_keywords == [randomize_inputs, randomize_inputs]
     assert target_profile_tokens == [1200]
     assert prefill_tokens == [4096]
     assert runner.max_num_tokens == 4096
@@ -1488,7 +1526,9 @@ def test_profile_run_restores_token_budget_after_failure(
 
     runner_module, _ = pcp_runner_module
 
-    def failing_profile_run(self):
+    @_assert_profile_keyword
+    def failing_profile_run(self, *, randomize_inputs: bool = False):
+        assert randomize_inputs is False
         assert self.max_num_tokens == 624
         raise RuntimeError("simulated profile failure")
 

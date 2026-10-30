@@ -113,20 +113,29 @@ def test_dummy_run_phase_is_not_published_when_feature_is_off(
     assert observed == [None]
 
 
+@pytest.mark.parametrize("num_active_loras", [0, 7])
 def test_real_batch_phase_remains_authoritative_without_dummy_scope(
     monkeypatch: pytest.MonkeyPatch,
+    num_active_loras: int,
 ):
     runner = _runner(deepep_auto=True)
     phase = np.array([True, False], dtype=np.bool_)
     input_batch = SimpleNamespace(is_prefilling_np=phase)
-    monkeypatch.setattr(
-        GPUModelRunner,
-        "prepare_inputs",
-        lambda self, scheduler_output, batch_req_state, batch_desc: input_batch,
-    )
+    def prepare_inputs(self, scheduler_output, batch_req_state, batch_desc,
+                       num_active_loras: int):
+        assert (scheduler_output, batch_req_state, batch_desc) == (
+            "scheduler", "state", "descriptor",
+        )
+        assert num_active_loras == expected_num_active_loras
+        assert type(num_active_loras) is int
+        return input_batch
+
+    expected_num_active_loras = num_active_loras
+    monkeypatch.setattr(GPUModelRunner, "prepare_inputs", prepare_inputs)
 
     with deepep_auto_request_phase_scope():
-        result = runner.prepare_inputs("scheduler", "state", "descriptor")
+        result = runner.prepare_inputs("scheduler", "state", "descriptor",
+                                       num_active_loras)
         assert result is input_batch
         assert get_deepep_auto_request_phase() is phase
 

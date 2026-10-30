@@ -18,7 +18,9 @@ from vllm_hcu.v1.glm53_pcp import (
 )
 from tests.runtime_patch.test_glm52_pcp_config import _make_pcp_config
 from tests.runtime_patch.test_glm52_pcp_manager import _make_batch, _make_managers
-from tests.runtime_patch.test_glm52_pcp_runner import _config, pcp_runner_module
+from tests.runtime_patch.test_glm52_pcp_runner import (
+    _assert_profile_keyword, _config, pcp_runner_module,
+)
 
 
 @pytest.mark.parametrize("architecture", [
@@ -86,27 +88,34 @@ def test_v4_runner_accepts_multiple_cache_groups_and_installs_global_metadata(
     assert runner.prepare_attn(SimpleNamespace()) == ("global-tables", "global-slots")
 
 
+@pytest.mark.parametrize("randomize_inputs", [False, True])
 @pytest.mark.parametrize("with_mtp", [False, True])
-def test_v4_profile_keeps_global_budget(pcp_runner_module, monkeypatch, with_mtp):
+def test_v4_profile_keeps_global_budget(
+    pcp_runner_module, monkeypatch, with_mtp, randomize_inputs,
+):
     module, _ = pcp_runner_module
     seen = []
-    monkeypatch.setattr(
-        module.GPUModelRunner, "profile_run",
-        lambda self: seen.append((self.max_num_tokens, self.speculator)),
-        raising=False,
-    )
+    @_assert_profile_keyword
+    def profile_run(self, *, randomize_inputs: bool = False):
+        assert randomize_inputs is self.expected_randomize_inputs
+        seen.append((self.max_num_tokens, self.speculator, randomize_inputs))
+
+    monkeypatch.setattr(module.GPUModelRunner, "profile_run", profile_run,
+                        raising=False)
     config = _config(8)
     config.model_config = SimpleNamespace(architectures=["DeepseekV4ForCausalLM"])
     runner = module.HcuGPUModelRunnerV2(config, "cpu")
     runner.max_num_tokens = 16384
     runner.speculator = object() if with_mtp else None
 
-    runner.profile_run()
+    runner.expected_randomize_inputs = randomize_inputs
+    runner.profile_run(randomize_inputs=randomize_inputs)
 
-    assert seen == [(16384, runner.speculator)]
+    assert seen == [(16384, runner.speculator, randomize_inputs)]
     assert runner.max_num_tokens == 16384
 
 
+@pytest.mark.parametrize("num_active_loras", [0, 3])
 @pytest.mark.parametrize("architecture,pcp", [
     ("DeepseekV4ForCausalLM", 8),
     ("Glm5NextForCausalLM", 8),
@@ -115,7 +124,7 @@ def test_v4_profile_keeps_global_budget(pcp_runner_module, monkeypatch, with_mtp
     ("Glm5NextForCausalLM", 1),
 ])
 def test_prepare_inputs_selects_deepep_phase_batch(
-    pcp_runner_module, monkeypatch, architecture, pcp,
+    pcp_runner_module, monkeypatch, architecture, pcp, num_active_loras,
 ):
     from vllm_hcu.forward_context_runtime import (
         deepep_auto_request_phase_scope, get_deepep_auto_request_phase,
@@ -133,13 +142,15 @@ def test_prepare_inputs_selects_deepep_phase_batch(
     global_batch = SimpleNamespace(is_prefilling_np=np.array([True]))
     local_batch = SimpleNamespace(is_prefilling_np=np.array([False]))
     runner.global_batch = global_batch
+    runner.expected_num_active_loras = num_active_loras
     runner.pcp_manager = None if pcp == 1 else SimpleNamespace(
         _global_batch=global_batch,
         partition_batch=lambda *args, **kwargs: local_batch,
     )
     with deepep_auto_request_phase_scope():
         result = runner.prepare_inputs("scheduler-output", "batch-req-state",
-                                       SimpleNamespace(num_tokens=1))
+                                       SimpleNamespace(num_tokens=1),
+                                       num_active_loras)
         expected_batch = global_batch if pcp == 1 else local_batch
         phase_batch = (global_batch if architecture == "DeepseekV4ForCausalLM"
                        else expected_batch)
