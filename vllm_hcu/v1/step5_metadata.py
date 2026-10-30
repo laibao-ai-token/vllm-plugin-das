@@ -163,6 +163,7 @@ def prepare_step5_attn(
     kv_cache_config: KVCacheConfig,
     for_capture: bool = False,
     ubatch_idx: int = 0,
+    model_specific_attn_metadata: ModelSpecificAttnMetadata | None = None,
 ) -> dict[str, Any]:
     if cudagraph_mode == CUDAGraphMode.FULL:
         # Use padded sizes - padding is handled by model_runner.prepare_attn.
@@ -213,6 +214,7 @@ def prepare_step5_attn(
         positions=input_batch.positions,
         is_prefilling=torch.from_numpy(input_batch.is_prefilling_np),
         mm_req_doc_ranges=req_doc_ranges,
+        model_specific_attn_metadata=model_specific_attn_metadata,
         for_cudagraph_capture=for_capture,
         rswa_prefix_lens=input_batch.prompt_lens,
         ubatch_idx=ubatch_idx,

@@ -28,6 +28,7 @@ SIGNATURES = (
             "kv_cache_config",
             "for_capture",
             "ubatch_idx",
+            "model_specific_attn_metadata",
         ),
     ),
 )
@@ -35,8 +36,8 @@ REVIEWED_SOURCES = (
     (
         "vllm.v1.worker.gpu.model_states.default.DefaultModelState.prepare_attn",
         (
-            "10d3722dbbed9652003fbc634b5183d344d5b9464bef8e2bcf35a615cae324c6",
-            "81017edcd386afc0200784e14e376deecaea6b9e623c0d035b112ca8dd46dde9",
+            # Same fixed v0.32 core body audited by the PCP companion.
+            "960d7e980889af5a667df8c07f85c7e9b92e484085ef3411b42a90d5d20d6dfd",
         ),
     ),
 )

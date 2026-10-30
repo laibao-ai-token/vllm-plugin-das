@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-"""Attach HCU PCP plans to vLLM 0.28 attention metadata."""
+"""Attach HCU PCP plans to vLLM 0.32 attention metadata."""
 
 from __future__ import annotations
 
@@ -26,11 +26,9 @@ PATCH_ID = "worker.framework_opt.pcp.default_model_state_metadata"
 TARGETS = (f"{TARGET_MODULE}.DefaultModelState.prepare_attn",)
 _MARKER = "_vllm_hcu_pcp_model_state_applied"
 _WRAPPER = "_vllm_hcu_pcp_model_state_wrapper"
-_V028_PREPARE_ATTN_SOURCE_SHA256 = (
-    # Re-audited after prepare_attn gained the host seq_lens / block table
-    # mirror pass-through (seq_lens_cpu, num_computed_tokens_cpu,
-    # block_tables_np); the PCP wrapper below is unaffected.
-    "81017edcd386afc0200784e14e376deecaea6b9e623c0d035b112ca8dd46dde9"
+_V032_PREPARE_ATTN_SOURCE_SHA256 = (
+    # Fixed core 5df63a7203: preserve model-specific metadata, including replay.
+    "960d7e980889af5a667df8c07f85c7e9b92e484085ef3411b42a90d5d20d6dfd"
 )
 
 
@@ -98,13 +96,7 @@ def _require_source_fingerprint(function, target: str, expected: str) -> None:
             f"actual=<unavailable>; {type(exc).__name__}: {exc}"
         ) from exc
     actual = hashlib.sha256(source.encode("utf-8")).hexdigest()
-    # The unchanged clean base and legacy Step5 metadata pass-through are
-    # both reviewed; retain the fail-closed check for all other source bodies.
-    reviewed = (
-        expected,
-        "10d3722dbbed9652003fbc634b5183d344d5b9464bef8e2bcf35a615cae324c6",
-    )
-    if actual not in reviewed:
+    if actual != expected:
         raise PatchCompatibilityError(
             f"required HCU patch target {target} source fingerprint "
             f"mismatch: expected sha256={expected}, actual sha256={actual}"
@@ -136,13 +128,18 @@ def apply_to_module(module: ModuleType) -> bool:
             "kv_cache_config",
             "for_capture",
             "ubatch_idx",
+            "model_specific_attn_metadata",
         ),
-        defaults={"for_capture": False, "ubatch_idx": 0},
+        defaults={
+            "for_capture": False,
+            "ubatch_idx": 0,
+            "model_specific_attn_metadata": None,
+        },
     )
     _require_source_fingerprint(
         original_prepare_attn,
         TARGETS[0],
-        _V028_PREPARE_ATTN_SOURCE_SHA256,
+        _V032_PREPARE_ATTN_SOURCE_SHA256,
     )
     original_code = getattr(original_prepare_attn, "__code__", None)
     original_required_names = {
@@ -159,7 +156,7 @@ def apply_to_module(module: ModuleType) -> bool:
     ):
         raise PatchCompatibilityError(
             f"required HCU patch target {TARGETS[0]} no longer matches the "
-            "audited v0.28 metadata path"
+            "audited v0.32 metadata path"
         )
 
     @functools.wraps(original_prepare_attn)
@@ -173,6 +170,7 @@ def apply_to_module(module: ModuleType) -> bool:
         kv_cache_config,
         for_capture=False,
         ubatch_idx=0,
+        model_specific_attn_metadata=None,
     ):
         pcp_size = int(self.vllm_config.parallel_config.prefill_context_parallel_size)
         has_global_prefill = True
@@ -203,6 +201,7 @@ def apply_to_module(module: ModuleType) -> bool:
                 kv_cache_config,
                 for_capture,
                 ubatch_idx,
+                model_specific_attn_metadata,
             )
         if pcp_size > 1:
             _attach_pcp_plan(

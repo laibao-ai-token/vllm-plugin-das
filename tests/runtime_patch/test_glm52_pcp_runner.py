@@ -824,6 +824,7 @@ def _original_prepare_attn(
     kv_cache_config,
     for_capture=False,
     ubatch_idx=0,
+    model_specific_attn_metadata=None,
 ):
     if cudagraph_mode == CUDAGraphMode.FULL:
         num_reqs = input_batch.num_reqs_after_padding
@@ -874,6 +875,7 @@ def _original_prepare_attn(
         for_cudagraph_capture=for_capture,
         rswa_prefix_lens=input_batch.prompt_lens,
         ubatch_idx=ubatch_idx,
+        model_specific_attn_metadata=model_specific_attn_metadata,
     )
 
 
@@ -887,6 +889,7 @@ def _prepare_attn_with_request_sizing_drift(
     kv_cache_config,
     for_capture=False,
     ubatch_idx=0,
+    model_specific_attn_metadata=None,
 ):
     if cudagraph_mode == CUDAGraphMode.FULL:
         num_reqs = input_batch.num_reqs_after_padding
@@ -932,6 +935,7 @@ def _prepare_attn_with_request_sizing_drift(
         for_cudagraph_capture=for_capture,
         rswa_prefix_lens=input_batch.prompt_lens,
         ubatch_idx=ubatch_idx,
+        model_specific_attn_metadata=model_specific_attn_metadata,
     )
 
 
@@ -973,7 +977,7 @@ def _accept_synthetic_model_state_sources(
 ) -> None:
     monkeypatch.setattr(
         adapter,
-        "_V028_PREPARE_ATTN_SOURCE_SHA256",
+        "_V032_PREPARE_ATTN_SOURCE_SHA256",
         _source_sha256(target.DefaultModelState.prepare_attn),
         raising=False,
     )
@@ -1070,9 +1074,7 @@ def test_pcp_default_model_state_slices_metadata_and_propagates_phase(
         "pcp_one_result": pcp_one,
         "pcp_one_query_gpu": captured["query_start_loc_gpu"].tolist(),
         "pcp_one_query_cpu": captured["query_start_loc_cpu"].tolist(),
-        "pcp_one_has_phase_adapter": (
-            "model_specific_attn_metadata" in captured
-        ),
+        "pcp_one_model_specific_metadata": captured["model_specific_attn_metadata"],
         "pcp_one_ubatch_idx": captured["ubatch_idx"],
     }
     assert payload == {
@@ -1083,7 +1085,7 @@ def test_pcp_default_model_state_slices_metadata_and_propagates_phase(
         "pcp_one_result": {"path": "original"},
         "pcp_one_query_gpu": [0, 1, 3],
         "pcp_one_query_cpu": [0, 1, 3],
-        "pcp_one_has_phase_adapter": False,
+        "pcp_one_model_specific_metadata": None,
         "pcp_one_ubatch_idx": 3,
     }
 
