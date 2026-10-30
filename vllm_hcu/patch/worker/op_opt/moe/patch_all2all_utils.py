@@ -7,6 +7,7 @@ from __future__ import annotations
 import functools
 from types import ModuleType
 
+from .._common import require_exact_signature
 from ._common import (
     check_module_marker,
     load_exact_module,
@@ -33,17 +34,25 @@ def apply_to_module(module: ModuleType) -> bool:
     if check_module_marker(target, _MARKER, wrapped):
         return False
     original = require_callable(target, "maybe_make_prepare_finalize", TARGETS[0])
-    require_parameter_names(
+    require_exact_signature(
         original,
         TARGETS[0],
-        (
+        positional=(
             "moe",
             "quant_config",
             "routing_tables",
             "allow_new_interface",
             "use_monolithic",
-            "eep_stage",
+            "all2all_manager",
+            "input_dtype",
         ),
+        defaults={
+            "routing_tables": None,
+            "allow_new_interface": False,
+            "use_monolithic": False,
+            "all2all_manager": None,
+            "input_dtype": None,
+        },
     )
     roundup = require_callable(target, "maybe_roundup_layer_hidden_size", TARGETS[1])
     require_parameter_names(
@@ -59,14 +68,20 @@ def apply_to_module(module: ModuleType) -> bool:
         routing_tables=None,
         allow_new_interface=False,
         use_monolithic=False,
-        eep_stage=False,
+        all2all_manager=None,
+        input_dtype=None,
     ):
         if getattr(
             moe.moe_parallel_config, "use_deepep_auto_kernels", False
         ):
             if quant_config is None:
                 raise RuntimeError("DeepEP auto requires a FusedMoEQuantConfig")
-            all2all_manager = target.get_ep_all2all_manager(eep_stage)
+            if input_dtype is not None:
+                # Auto dispatch requires quantized-input experts; it has no
+                # deferred-input-quant contract for an input dtype override.
+                raise NotImplementedError("HCU DeepEP auto does not support input_dtype overrides")
+            if all2all_manager is None:
+                all2all_manager = target.get_ep_all2all_manager()
             if not getattr(all2all_manager, "is_deepep_auto_manager", False):
                 raise RuntimeError(
                     "DeepEP auto requires DeepEPAutoAll2AllManager"
@@ -155,7 +170,8 @@ def apply_to_module(module: ModuleType) -> bool:
             routing_tables,
             allow_new_interface,
             use_monolithic,
-            eep_stage,
+            all2all_manager=all2all_manager,
+            input_dtype=input_dtype,
         )
         ll_class = getattr(target, "DeepEPLLPrepareAndFinalize", None)
         if ll_class is None or not isinstance(prepare_finalize, ll_class):

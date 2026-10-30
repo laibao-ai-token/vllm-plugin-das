@@ -164,6 +164,7 @@ def test_all2all_dispatch_selection_contract():
         pass
 
     prepare_finalize = DeepEPLLPrepareAndFinalize()
+    calls = []
 
     def maybe_make_prepare_finalize(
         moe,
@@ -171,15 +172,18 @@ def test_all2all_dispatch_selection_contract():
         routing_tables=None,
         allow_new_interface=False,
         use_monolithic=False,
-        eep_stage=False,
+        all2all_manager=None,
+        input_dtype=None,
     ):
+        calls.append((all2all_manager, input_dtype))
         del (
             moe,
             quant_config,
             routing_tables,
             allow_new_interface,
             use_monolithic,
-            eep_stage,
+            all2all_manager,
+            input_dtype,
         )
         return prepare_finalize
 
@@ -209,11 +213,21 @@ def test_all2all_dispatch_selection_contract():
     assert result is prepare_finalize
     assert result.use_fp8_dispatch is True
     assert result.use_int8_dispatch is False
+    assert calls == [(None, None)]
 
     int8_config = SimpleNamespace(quant_dtype=torch.int8)
-    result = module.maybe_make_prepare_finalize(moe, int8_config)
+    manager = object()
+    result = module.maybe_make_prepare_finalize(
+        moe, int8_config, all2all_manager=manager, input_dtype=torch.bfloat16,
+    )
     assert result.use_fp8_dispatch is False
     assert result.use_int8_dispatch is True
+    assert calls[-1][0] is manager and calls[-1][1] is torch.bfloat16
+    module.maybe_make_prepare_finalize(moe, int8_config, None, False, False, manager, torch.float16)
+    assert calls[-1][0] is manager and calls[-1][1] is torch.float16
+    module.maybe_make_prepare_finalize = maybe_make_prepare_finalize
+    with pytest.raises(PatchCompatibilityError, match="stale"):
+        patch_all2all_utils.apply_to_module(module)
 
 
 def test_all2all_auto_builds_ht_and_ll_around_one_manager_handle():
@@ -225,7 +239,11 @@ def test_all2all_auto_builds_ht_and_ll_around_one_manager_handle():
         world_size = 2
         rank = 1
 
+        def __bool__(self):
+            return False
+
         def get_handle(self, kwargs):
+            calls["manager"] = self
             calls["handle_kwargs"] = kwargs
             return "shared-handle"
 
@@ -254,7 +272,8 @@ def test_all2all_auto_builds_ht_and_ll_around_one_manager_handle():
         routing_tables=None,
         allow_new_interface=False,
         use_monolithic=False,
-        eep_stage=False,
+        all2all_manager=None,
+        input_dtype=None,
     ):
         del (
             moe,
@@ -262,7 +281,8 @@ def test_all2all_auto_builds_ht_and_ll_around_one_manager_handle():
             routing_tables,
             allow_new_interface,
             use_monolithic,
-            eep_stage,
+            all2all_manager,
+            input_dtype,
         )
         return "official"
 
@@ -273,11 +293,15 @@ def test_all2all_auto_builds_ht_and_ll_around_one_manager_handle():
         return hidden_size
 
     manager = Manager()
+    calls["default_manager_lookups"] = 0
+    def get_ep_all2all_manager():
+        calls["default_manager_lookups"] += 1
+        return manager
     module = _module(
         patch_all2all_utils.TARGET_MODULE,
         torch=torch,
         current_platform=SimpleNamespace(fp8_dtype=lambda: torch.float8_e4m3fn),
-        get_ep_all2all_manager=lambda eep_stage=False: manager,
+        get_ep_all2all_manager=get_ep_all2all_manager,
         get_current_vllm_config=lambda: SimpleNamespace(
             scheduler_config=SimpleNamespace(max_num_seqs=4),
             speculative_config=SimpleNamespace(num_speculative_tokens=2),
@@ -301,6 +325,8 @@ def test_all2all_auto_builds_ht_and_ll_around_one_manager_handle():
         SimpleNamespace(quant_dtype=torch.float8_e4m3fn),
         routing_tables,
     )
+    assert calls["default_manager_lookups"] == 1
+    assert calls["manager"] is manager
     assert calls["handle_kwargs"] == {
         "max_num_tokens_per_dp_rank": 12,
         "token_hidden_size": 7168,
@@ -325,11 +351,26 @@ def test_all2all_auto_builds_ht_and_ll_around_one_manager_handle():
         "local_expert_global_ids": "local-ids",
     }
     assert result.ll_prepare_finalize._vllm_hcu_clean_low_latency_buffer is True
+    explicit_manager = Manager()
     int8_result = module.maybe_make_prepare_finalize(
         moe,
         SimpleNamespace(quant_dtype=torch.int8),
         routing_tables,
+        all2all_manager=explicit_manager,
+        input_dtype=None,
     )
+    assert calls["manager"] is explicit_manager
+    assert calls["default_manager_lookups"] == 1
+    with pytest.raises(NotImplementedError, match="input_dtype overrides"):
+        module.maybe_make_prepare_finalize(
+            moe, SimpleNamespace(quant_dtype=torch.int8),
+            all2all_manager=explicit_manager, input_dtype=torch.bfloat16,
+        )
+    with pytest.raises(RuntimeError, match="DeepEPAutoAll2AllManager"):
+        module.maybe_make_prepare_finalize(
+            moe, SimpleNamespace(quant_dtype=torch.int8), all2all_manager=object(),
+        )
+    assert calls["default_manager_lookups"] == 1
     assert int8_result.ll_prepare_finalize.kwargs == {
         "max_tokens_per_rank": 12,
         "num_dispatchers": 2,
@@ -351,6 +392,117 @@ def test_all2all_auto_builds_ht_and_ll_around_one_manager_handle():
             SimpleNamespace(quant_dtype=torch.float8_e4m3fn),
             routing_tables,
         )
+
+
+def _fixed_core_all2all_module():
+    """Load actual core factory bodies without importing GPU dependencies."""
+    import ast
+    from dataclasses import dataclass
+
+    repository = Path(__file__).resolve().parents[2]
+    core = Path(os.environ.get("VLLM_SOURCE_ROOT", repository.parent.parent / "vllm-community-main"))
+    source = core / "vllm/model_executor/layers/fused_moe/all2all_utils.py"
+    if not source.is_file():
+        pytest.skip("set VLLM_SOURCE_ROOT to the paired core source checkout")
+
+    class DeepEPLLPrepareAndFinalize:
+        def __init__(self, handle, **kwargs):
+            self.handle, self.kwargs = handle, kwargs
+
+    class FlashInferPrepareAndFinalize:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    def forbidden_default_manager():
+        raise AssertionError("explicit manager must not fall back to the global EP group")
+
+    module = _module(
+        patch_all2all_utils.TARGET_MODULE,
+        torch=torch,
+        dataclass=dataclass,
+        current_platform=SimpleNamespace(is_xpu=lambda: False, fp8_dtype=lambda: torch.float8_e4m3fn),
+        DeepEPLLPrepareAndFinalize=DeepEPLLPrepareAndFinalize,
+        DEEPEP_QUANT_BLOCK_SHAPE=[128, 128],
+        FlashInferNVLinkOneSidedPrepareAndFinalize=FlashInferPrepareAndFinalize,
+        get_ep_all2all_manager=forbidden_default_manager,
+        get_current_vllm_config=lambda: SimpleNamespace(scheduler_config=SimpleNamespace(max_num_batched_tokens=256)),
+    )
+    names = {"FlashInferOneSidedDispatchLayout", "flashinfer_one_sided_dispatch_layout",
+             "maybe_make_prepare_finalize", "maybe_roundup_layer_hidden_size"}
+    tree = ast.parse(source.read_text(), filename=str(source))
+    tree.body = [node for node in tree.body if getattr(node, "name", None) in names]
+    tree.body.insert(0, ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0))
+    ast.fix_missing_locations(tree)
+    # dataclass resolves deferred annotations through the defining module.
+    previous = sys.modules.get(module.__name__)
+    sys.modules[module.__name__] = module
+    try:
+        exec(compile(tree, str(source), "exec"), module.__dict__)
+    finally:
+        if previous is None:
+            sys.modules.pop(module.__name__, None)
+        else:
+            sys.modules[module.__name__] = previous
+    return module
+
+
+@pytest.mark.parametrize("backend,input_dtype", [("ll", None), ("flash", torch.float16), ("flash", torch.bfloat16)])
+def test_all2all_real_core_factory_preserves_manager_and_input_dtype(backend, input_dtype):
+    module = _fixed_core_all2all_module()
+    calls = []
+    class Manager:
+        world_size = dp_world_size = 8
+        rank = 0
+        def __bool__(self):
+            return False
+        def get_handle(self, kwargs):
+            calls.append(kwargs)
+            return self
+    manager = Manager()
+    flags = dict(use_deepep_ht_kernels=False, use_deepep_ll_kernels=backend == "ll",
+                 use_deepep_v2_kernels=False, use_moonep_kernels=False, use_mori_kernels=False,
+                 use_fi_nvl_two_sided_kernels=False, use_fi_nvl_one_sided_kernels=backend == "flash")
+    moe = SimpleNamespace(moe_parallel_config=SimpleNamespace(use_passthrough_all2all=False,
+                           use_all2all_kernels=True, use_deepep_auto_kernels=False),
+                          dp_size=8, max_num_tokens=256, hidden_dim=5120,
+                          num_experts=256, num_local_experts=32, experts_per_token=8, **flags)
+    assert patch_all2all_utils.apply_to_module(module)
+    assert not patch_all2all_utils.apply_to_module(module)
+    result = module.maybe_make_prepare_finalize(
+        moe, SimpleNamespace(quant_dtype=torch.int8 if backend == "ll" else "nvfp4", block_shape=None),
+        all2all_manager=manager, input_dtype=input_dtype,
+    )
+    if backend == "ll":
+        assert result.handle is manager
+        assert result.use_int8_dispatch and not result.use_fp8_dispatch
+        assert calls[0]["max_num_tokens_per_dp_rank"] == result.kwargs["max_tokens_per_rank"] == 256
+        assert calls[0]["num_ep_ranks"] == result.kwargs["num_dispatchers"] == 8
+    else:
+        # The real core layout helper must see the override, rather than the
+        # NVFP4 quantized payload (hidden/2 plus scale bytes).
+        assert result.kwargs["x_bytes_per_token"] == 5120 * 2
+        assert result.kwargs["x_sf_bytes_per_token"] == 0
+
+
+@pytest.mark.parametrize("definition", [
+    "def changed(moe, quant_config, routing_tables=None, allow_new_interface=False, use_monolithic=False, eep_stage=False): pass",
+    "def changed(moe, quant_config, routing_tables=None, allow_new_interface=False, use_monolithic=False, all2all_manager=None, renamed=None): pass",
+    "def changed(moe, quant_config, routing_tables=None, allow_new_interface=False, use_monolithic=False, *, all2all_manager=None, input_dtype=None): pass",
+    "def changed(moe, quant_config, routing_tables=None, allow_new_interface=False, use_monolithic=False, all2all_manager=None, input_dtype=1): pass",
+])
+def test_all2all_factory_signature_drift_rejected_without_partial_patch(definition):
+    namespace = {}
+    exec(definition, namespace)
+    factory = namespace["changed"]
+    def roundup(hidden_size, act_dtype, moe_parallel_config):
+        return hidden_size
+    module = _module(patch_all2all_utils.TARGET_MODULE,
+                     maybe_make_prepare_finalize=factory, maybe_roundup_layer_hidden_size=roundup)
+    with pytest.raises(PatchCompatibilityError, match="incompatible signature"):
+        patch_all2all_utils.apply_to_module(module)
+    assert module.maybe_make_prepare_finalize is factory
+    assert module.maybe_roundup_layer_hidden_size is roundup
+    assert not getattr(module, "_vllm_hcu_all2all_dispatch_applied", False)
 
 
 def test_deepep_auto_prepare_snapshots_mode_for_matching_finalize(
