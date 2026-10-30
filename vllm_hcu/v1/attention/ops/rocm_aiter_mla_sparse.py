@@ -9,6 +9,11 @@ from importlib.util import find_spec
 from inspect import Parameter, signature
 
 import torch
+
+from vllm_hcu.v1.attention.ops.indexer_candidates import (
+    apply_candidate_mask, candidate_topk, select_candidate_blocks,
+    validate_candidate_schema,
+)
 import torch.nn.functional as F
 
 from vllm.forward_context import get_forward_context
@@ -1679,7 +1684,14 @@ def rocm_aiter_sparse_attn_indexer_native(
     dcp_rank: int = 0,
     dcp_world_size: int = 1,
     cp_kv_cache_interleave_size: int = 1,
+    candidate_blocks: torch.Tensor | None = None,
+    candidate_block_size: int = 0,
+    candidate_write: bool = False,
 ) -> torch.Tensor:
+    validate_candidate_schema(
+        candidate_blocks, candidate_block_size, candidate_write,
+        topk_indices_buffer, dcp_world_size=dcp_world_size,
+    )
     # careful! this will be None in dummy run
     attn_metadata = get_forward_context().attn_metadata
     fp8_dtype = (
@@ -1712,6 +1724,11 @@ def rocm_aiter_sparse_attn_indexer_native(
     assert isinstance(layer_attn_metadata, DeepseekV32IndexerMetadata)
     assert topk_indices_buffer is not None
     assert scale_fmt is not None
+    if candidate_blocks is not None:
+        from vllm_hcu.patch.worker.core_fix.patch_deepseek_v4_pcp import current_pcp_batch
+        if (current_pcp_batch() is not None
+                or getattr(layer_attn_metadata, "pcp_world_size", 1) != 1):
+            raise NotImplementedError("HCU candidate filtering does not support PCP rows")
     slot_mapping = layer_attn_metadata.slot_mapping[:layer_attn_metadata.num_kv_actual_tokens]
     has_decode = layer_attn_metadata.num_decodes > 0
     has_prefill = layer_attn_metadata.num_prefills > 0
@@ -1727,6 +1744,12 @@ def rocm_aiter_sparse_attn_indexer_native(
     # HIPC cache writer/gather require the physical page axis. Keep the
     # official view unchanged for the LightOp paged-MQA decode contract.
     hipc_kv_cache = _indexer_cache_as_hipc_view(kv_cache)
+    if candidate_blocks is not None:
+        if hidden_states.shape[0] > candidate_blocks.shape[0]:
+            raise ValueError("candidate buffer has too few token rows")
+        if candidate_write:
+            # Clear every current row, including no-KV and graph padding rows.
+            candidate_blocks[:hidden_states.shape[0]].fill_(-1)
 
     # during speculative decoding, k may be padded to the CUDA graph batch
     # size while slot_mapping only covers actual tokens.
@@ -1871,7 +1894,26 @@ def rocm_aiter_sparse_attn_indexer_native(
                     row_starts,
                     row_ends,
                 )
-                if _use_lightop_sparse_mla_topk():
+                chunk_candidates = (
+                    candidate_blocks[chunk.token_start:chunk.token_end]
+                    if candidate_blocks is not None else None
+                )
+                if chunk_candidates is not None:
+                    if candidate_write:
+                        select_candidate_blocks(
+                            logits, row_starts, row_ends, candidate_block_size,
+                            chunk_candidates,
+                        )
+                    else:
+                        apply_candidate_mask(
+                            logits, row_starts, row_ends, chunk_candidates,
+                            candidate_block_size,
+                        )
+                if chunk_candidates is not None and not candidate_write:
+                    topk_indices.copy_(candidate_topk(
+                        logits, topk_tokens, row_starts, row_ends,
+                    ))
+                elif _use_lightop_sparse_mla_topk():
                     _lightop_topk_indices_prefill(
                         logits,
                         row_starts,
@@ -1940,10 +1982,27 @@ def rocm_aiter_sparse_attn_indexer_native(
             else decode_metadata.seq_lens
         )
 
+        decode_weights = weights[:num_padded_tokens]
+        if candidate_blocks is not None and decode_metadata.requires_padding:
+            # Q is packed by request; weights must follow exactly the same rows.
+            decode_weights = pack_seq_triton(
+                weights[:num_decode_tokens], decode_lens, pad_value=0,
+            ).reshape(num_padded_tokens, *weights.shape[1:])
+            # Native bounds are the last next_n effective contexts. A short
+            # request's packed Q begins at slot zero, so shift bounds to its
+            # actual suffix and invalidate unused rectangular slots.
+            if seq_lens.ndim != 2 or seq_lens.shape[1] != next_n:
+                raise NotImplementedError(
+                    "candidate ragged decode requires per-token 2D context lengths"
+                )
+            steps = torch.arange(next_n, device=seq_lens.device)[None, :]
+            lengths = decode_lens.to(device=seq_lens.device, dtype=torch.long)[:, None]
+            columns = (steps + next_n - lengths).clamp(0, next_n - 1)
+            seq_lens = seq_lens.gather(1, columns).masked_fill(steps >= lengths, 0)
         logits = rocm_fp8_paged_mqa_logits(
             padded_q_fp8_decode_tokens,
             kv_cache,
-            weights[:num_padded_tokens],
+            decode_weights,
             seq_lens,
             decode_metadata.block_table,
             decode_metadata.schedule_metadata,
@@ -1964,7 +2023,28 @@ def rocm_aiter_sparse_attn_indexer_native(
             decode_metadata.requires_padding,
         )
 
-        if use_lightop_sparse_mla_topk:
+        decode_candidates = None
+        if candidate_blocks is not None:
+            row_ends = _decode_row_ends_from_seq_lens(seq_lens, next_n, logits.shape[0])
+            if decode_metadata.requires_padding:
+                # Pack only actual decode rows into disjoint rectangular scratch.
+                # The shared suffix already contains this forward's prefill pool.
+                decode_candidates = pack_seq_triton(
+                    candidate_blocks[:num_decode_tokens], decode_lens, pad_value=-1,
+                ).reshape(num_padded_tokens, -1)
+            else:
+                decode_candidates = candidate_blocks[:num_padded_tokens]
+            if candidate_write:
+                select_candidate_blocks(
+                    logits, None, row_ends, candidate_block_size, decode_candidates,
+                )
+            else:
+                apply_candidate_mask(
+                    logits, None, row_ends, decode_candidates, candidate_block_size,
+                )
+        if decode_candidates is not None and not candidate_write:
+            topk_indices.copy_(candidate_topk(logits, topk_tokens, None, row_ends))
+        elif use_lightop_sparse_mla_topk:
             _lightop_topk_indices_decode(
                 logits, seq_lens, next_n, topk_indices, topk_tokens
             )
@@ -2005,6 +2085,11 @@ def rocm_aiter_sparse_attn_indexer_native(
             topk_indices_buffer[:num_decode_tokens, : topk_indices.shape[-1]] = (
                 topk_indices
             )
+            if decode_candidates is not None and candidate_write:
+                unpacked_candidates = unpack_seq_triton(
+                    decode_candidates.reshape(batch_size, next_n, -1), decode_lens,
+                )
+                candidate_blocks[:num_decode_tokens].copy_(unpacked_candidates)
 
     return topk_indices_buffer
 

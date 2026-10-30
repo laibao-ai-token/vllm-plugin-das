@@ -723,6 +723,11 @@ def test_attention_int8_wo_a_is_excluded_only_during_construction(
     assert quant_config.ignore == []
 
 
+@pytest.mark.parametrize("dtype_as_keyword", (False, True))
+@pytest.mark.parametrize(
+    ("use_fp4", "weights_out_dtype"),
+    ((False, torch.float32), (True, torch.bfloat16)),
+)
 @pytest.mark.parametrize(
     ("is_gfx938", "expected_dtype", "expected_head_dim"),
     (
@@ -734,6 +739,9 @@ def test_deepseek_v4_indexer_cache_matches_hcu_reader_contract(
     is_gfx938: bool,
     expected_dtype: torch.dtype,
     expected_head_dim: int,
+    use_fp4: bool,
+    weights_out_dtype: torch.dtype,
+    dtype_as_keyword: bool,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """gfx936 uses the BF16 reader; gfx938 retains its quantized cache."""
@@ -788,6 +796,9 @@ def test_deepseek_v4_indexer_cache_matches_hcu_reader_contract(
             self.head_dim = 128
             self.k_cache = SimpleNamespace(dtype=torch.uint8, head_dim=132)
 
+    delegate_calls = []
+    delegate_result = ((object(), object()), object()) if use_fp4 else object()
+
     def fused_indexer_q_rope_quant(
         positions,
         index_q,
@@ -796,7 +807,9 @@ def test_deepseek_v4_indexer_cache_matches_hcu_reader_contract(
         index_weights_softmax_scale,
         index_weights_head_scale,
         use_fp4=False,
+        weights_out_dtype=torch.float32,
     ):
+        delegate_calls.append((use_fp4, weights_out_dtype))
         del (
             positions,
             index_q,
@@ -806,7 +819,7 @@ def test_deepseek_v4_indexer_cache_matches_hcu_reader_contract(
             index_weights_head_scale,
             use_fp4,
         )
-        return "quantized"
+        return delegate_result
 
     module = _module(
         patch_deepseek_v4_attention.TARGET_MODULE,
@@ -828,19 +841,30 @@ def test_deepseek_v4_indexer_cache_matches_hcu_reader_contract(
 
     assert indexer.k_cache.dtype is expected_dtype
     assert indexer.k_cache.head_dim == expected_head_dim
-    q_result = module.fused_indexer_q_rope_quant(
+    args = (
         torch.tensor([0]),
         torch.ones((1, 1, 4), dtype=torch.bfloat16),
         torch.tensor([[1.0, 1.0, 0.0, 0.0]]),
-        torch.ones((1, 1)),
+        torch.ones((1, 1), dtype=torch.bfloat16),
         0.5,
         0.25,
     )
-    if is_gfx938:
-        assert q_result == "quantized"
+    if dtype_as_keyword:
+        q_result = module.fused_indexer_q_rope_quant(
+            *args, use_fp4=use_fp4, weights_out_dtype=weights_out_dtype
+        )
     else:
+        q_result = module.fused_indexer_q_rope_quant(
+            *args, use_fp4, weights_out_dtype
+        )
+    if is_gfx938 or use_fp4:
+        assert q_result is delegate_result
+        assert delegate_calls == [(use_fp4, weights_out_dtype)]
+    else:
+        assert delegate_calls == []
         query, scaled_weights = q_result
         assert query.dtype is torch.bfloat16
+        assert scaled_weights.dtype is torch.float32
         torch.testing.assert_close(scaled_weights, torch.tensor([[0.125]]))
 
 
@@ -1421,3 +1445,13 @@ def test_mhc_patch_rejects_missing_capability_flag() -> None:
 
     with pytest.raises(PatchCompatibilityError, match="HAS_AITER_MHC"):
         patch_mhc_backend.apply_to_module(module)
+
+
+def test_deepseek_v4_bf16_indexer_rejects_non_fp32_dense_weights():
+    # Match the upstream dense scoring contract instead of silently coercing
+    # a dtype intended for the FP4 scoring path.
+    with pytest.raises(AssertionError):
+        patch_deepseek_v4_attention._bf16_indexer_q_rope(
+            None, None, None, None, 0.5, 0.25,
+            weights_out_dtype=torch.bfloat16,
+        )

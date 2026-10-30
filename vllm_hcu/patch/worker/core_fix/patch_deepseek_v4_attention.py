@@ -179,8 +179,10 @@ def _bf16_indexer_q_rope(
     weights: torch.Tensor,
     softmax_scale: float,
     head_scale: float,
+    weights_out_dtype: torch.dtype = torch.float32,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Apply interleaved GPT-J RoPE without introducing FP8 on gfx936."""
+    """Apply BF16 RoPE with the upstream dense-logits FP32 weight contract."""
+    assert weights_out_dtype == torch.float32, weights_out_dtype
     rotary_dim = cos_sin_cache.shape[-1]
     if rotary_dim % 2 or rotary_dim > q.shape[-1]:
         raise ValueError(
@@ -295,8 +297,9 @@ def apply_to_module(module: ModuleType) -> bool:
                 "index_weights_softmax_scale",
                 "index_weights_head_scale",
                 "use_fp4",
+                "weights_out_dtype",
             ),
-            defaults={"use_fp4": False},
+            defaults={"use_fp4": False, "weights_out_dtype": torch.float32},
         )
     require_exact_signature(
         original_init,
@@ -437,6 +440,7 @@ def apply_to_module(module: ModuleType) -> bool:
             index_weights_softmax_scale,
             index_weights_head_scale,
             use_fp4=False,
+            weights_out_dtype=torch.float32,
         ):
             if on_gfx938() or use_fp4:
                 return original_indexer_q(
@@ -447,6 +451,7 @@ def apply_to_module(module: ModuleType) -> bool:
                     index_weights_softmax_scale,
                     index_weights_head_scale,
                     use_fp4,
+                    weights_out_dtype=weights_out_dtype,
                 )
             return _bf16_indexer_q_rope(
                 positions,
@@ -455,6 +460,7 @@ def apply_to_module(module: ModuleType) -> bool:
                 index_weights,
                 index_weights_softmax_scale,
                 index_weights_head_scale,
+                weights_out_dtype=weights_out_dtype,
             )
 
         setattr(hcu_indexer_q_rope_quant, _INDEXER_Q_WRAPPER_MARKER, True)
