@@ -85,6 +85,9 @@ def apply_int8_linear(
             f"{input.ndim} and {weight.ndim}"
         )
 
+    if input.shape[-1] == 0:
+        raise HcuInt8LinearError("HCU W8A8 activation K must be positive")
+
     try:
         from vllm_hcu.platforms import envs as henvs
     except Exception as exc:
@@ -108,6 +111,10 @@ def apply_int8_linear(
                 "fused HCU W8A8 input must be a (quantized_tensor, scale) tuple"
             )
         x_q, x_scale = x_and_scale_quanted
+    elif input.numel() == 0:
+        # No activation quantizer may be called for zero local rows.
+        x_q = torch.empty_like(input, dtype=torch.int8)
+        x_scale = input.new_empty((*input.shape[:-1], 1), dtype=torch.float32)
     else:
         try:
             from lightop.quant import per_token_quant_int8
@@ -145,6 +152,28 @@ def apply_int8_linear(
         raise HcuInt8LinearError(
             f"HCU W8A8 bias dtype {bias.dtype} does not match output {out_dtype}"
         )
+
+    if m == 0:
+        # Keep Engram lookup/prefetch and the enclosing Linear collectives.
+        # Only the local quantization/GEMM is skipped, after validation.
+        if tuple(weight_scale.shape) not in ((), (1,), (1, 1), (n, 1)):
+            raise HcuInt8LinearError(
+                "HCU W8A8 empty weight scale must be scalar or channelwise"
+            )
+        if any(t.device != input.device for t in (x_q, x_scale, weight, weight_scale)):
+            raise HcuInt8LinearError("HCU W8A8 empty operands must share a device")
+        if bias is not None:
+            if bias.device != input.device:
+                raise HcuInt8LinearError("HCU W8A8 bias device does not match output")
+            try:
+                broadcast = torch.broadcast_shapes((0, n), bias.shape)
+            except RuntimeError as exc:
+                raise HcuInt8LinearError(
+                    "HCU W8A8 bias shape does not match output"
+                ) from exc
+            if tuple(broadcast) != (0, n):
+                raise HcuInt8LinearError("HCU W8A8 bias shape does not match output")
+        return input.new_empty((*input.shape[:-1], n), dtype=out_dtype)
 
     try:
         from lightop.gemm_ops import hipblaslt_w8a8_gemm
