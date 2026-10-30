@@ -170,7 +170,7 @@ def apply_to_module(module: ModuleType) -> bool:
         routed_experts_cls, "get_expert_weights", TARGETS[1]
     )
     load_weights = require_callable(routed_experts_cls, "load_weights", TARGETS[2])
-    require_parameter_names(
+    factory_signature = require_parameter_names(
         factory,
         TARGETS[0],
         (
@@ -184,14 +184,24 @@ def apply_to_module(module: ModuleType) -> bool:
             "apply_router_weight_on_input", "activation", "enable_eplb",
             "num_redundant_experts", "has_bias", "is_sequence_parallel",
             "reduce_results", "ckpt_names", "is_fused_checkpoint_transposed",
-            "n_shared_experts", "fuse_shared_experts", "router_logits_dtype",
+            "n_shared_experts", "fuse_shared_experts", "shared_expert_prefix",
+            "router_logits_dtype",
             "gate", "shared_experts", "shared_expert_gate", "routed_input_transform",
             "routed_output_transform", "apply_routed_scale_to_output",
             "zero_expert_type", "hash_indices_table", "bias_vl",
             "image_sentinel_lo", "runner_cls", "runner_args",
-            "routed_experts_cls", "routed_experts_args",
+            "routed_experts_cls", "routed_experts_args", "skip_padding",
         ),
     )
+    for name, default in (("shared_expert_prefix", None), ("skip_padding", False)):
+        parameter = factory_signature.parameters[name]
+        if (
+            parameter.kind is not inspect.Parameter.POSITIONAL_OR_KEYWORD
+            or parameter.default is not default
+        ):
+            raise PatchCompatibilityError(
+                f"required HCU patch target {TARGETS[0]} has incompatible signature {factory_signature}"
+            )
     require_parameter_names(get_weights, TARGETS[1], ("self",))
     require_parameter_names(load_weights, TARGETS[2], ("self", "weights"))
 

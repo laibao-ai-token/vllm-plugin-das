@@ -1979,11 +1979,12 @@ def test_moe_layer_forward_and_repacked_weight_contract(
         "enable_eplb", "num_redundant_experts", "has_bias",
         "is_sequence_parallel", "reduce_results", "ckpt_names",
         "is_fused_checkpoint_transposed", "n_shared_experts", "fuse_shared_experts",
+        "shared_expert_prefix",
         "router_logits_dtype", "gate", "shared_experts", "shared_expert_gate",
         "routed_input_transform", "routed_output_transform",
         "apply_routed_scale_to_output", "zero_expert_type", "hash_indices_table",
         "bias_vl", "image_sentinel_lo", "runner_cls", "runner_args",
-        "routed_experts_cls", "routed_experts_args",
+        "routed_experts_cls", "routed_experts_args", "skip_padding",
     )
 
     class UnquantizedFusedMoEMethod:
@@ -2052,7 +2053,7 @@ def test_moe_layer_forward_and_repacked_weight_contract(
     )
     source = (
         "def FusedMoEFactory("
-        + ", ".join(f"{name}=None" for name in factory_names)
+        + ", ".join(f"{name}={False if name == 'skip_padding' else None}" for name in factory_names)
         + "):\n    factory_calls.append((enable_eplb, num_redundant_experts))\n"
         + "    return Runner(apply_router_weight_on_input, activation, pcp_size)\n"
     )
