@@ -72,7 +72,6 @@ def test_platform_core_inventory_is_explicit_and_ordered():
     assert platform_core_callback_names() == (
         ("platform.core_fix.deep_gemm_foundation", "vllm.utils.deep_gemm"),
         ("platform.core_fix.envs", "vllm.envs"),
-        ("platform.core_fix.engram_config.hcu", "vllm.config.engram"),
         ("platform.core_fix.import_utils.deep_gemm", "vllm.utils.import_utils"),
         (
             "platform.core.layer_name_value_member",

@@ -26,7 +26,6 @@ from . import (
     patch_step5_compile_prefix,
     patch_step5_ep_graph_capture,
     patch_compilation_config,
-    patch_engram_config,
     patch_engine_args,
     patch_envs,
     patch_hy_v3_reasoning_parser,
@@ -46,7 +45,6 @@ from . import (
 _ORDERED_ADAPTERS = (
     patch_deep_gemm_foundation,
     patch_envs,
-    patch_engram_config,
     patch_import_utils,
     patch_layer_name,
     patch_nixl_utils,
