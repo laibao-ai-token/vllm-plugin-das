@@ -937,21 +937,8 @@ def apply_to_module(module: ModuleType) -> bool:
 
     @functools.wraps(get_v2_unsupported_features)
     def hcu_get_v2_model_runner_unsupported_features(self) -> list[str]:
-        unsupported = get_v2_unsupported_features(self)
-        try:
-            hcu_pcp_enabled = _validate_hcu_pcp_scope(self)
-        except ValueError:
-            # Leave every out-of-scope PCP configuration on the exact upstream
-            # rejection path. The direct scope check provides its actionable
-            # diagnostic without relaxing vLLM's generic V2 contract.
-            return unsupported
-        if not hcu_pcp_enabled:
-            return unsupported
-        return [
-            feature
-            for feature in unsupported
-            if feature != "prefill context parallelism"
-        ]
+        # Native V2 supports PCP; scope validation reads the selector.
+        return get_v2_unsupported_features(self)
 
     @functools.wraps(validate_v2_model_runner)
     def hcu_validate_v2_model_runner(self) -> Any:

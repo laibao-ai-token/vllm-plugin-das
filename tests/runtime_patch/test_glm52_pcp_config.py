@@ -505,7 +505,9 @@ def test_glm52_pcp_scope_rejects_unsupported_combinations(
         )
 
 
-def _make_vllm_module() -> ModuleType:
+def _make_vllm_module(native_reasons: list[str] | None = None) -> ModuleType:
+    # Fixed native V2 supports PCP; unsupported reasons are independent of PCP.
+    reasons = [] if native_reasons is None else native_reasons
     module = ModuleType(patch_vllm_config.TARGET_MODULE)
 
     class ModelConfig:
@@ -531,9 +533,7 @@ def _make_vllm_module() -> ModuleType:
             return None
 
         def _get_v2_model_runner_unsupported_features(self) -> list[str]:
-            if self.parallel_config.prefill_context_parallel_size > 1:
-                return ["prefill context parallelism"]
-            return ["upstream feature"]
+            return reasons
 
         def _validate_v2_model_runner(self) -> None:
             unsupported = self._get_v2_model_runner_unsupported_features()
@@ -553,10 +553,10 @@ def _as_fake_vllm_config(module: ModuleType, config: object) -> object:
     return patched_config
 
 
-def test_valid_glm52_pcp_removes_only_the_upstream_pcp_rejection(
+def test_valid_glm52_pcp_preserves_native_v2_admission(
     make_pcp_config,
 ) -> None:
-    """Restoring the original unsupported list must reject valid GLM PCP."""
+    """Fixed native V2 admits PCP without a synthetic unsupported reason."""
 
     module = _make_vllm_module()
     assert patch_vllm_config.apply_to_module(module) is True
@@ -588,17 +588,47 @@ def test_pcp1_preserves_upstream_v2_unsupported_feature_and_validation(
 ) -> None:
     """Accidentally bypassing non-PCP V2 validation must fail this test."""
 
-    module = _make_vllm_module()
+    module = _make_vllm_module(["dual batch overlap"])
     assert patch_vllm_config.apply_to_module(module) is True
     config = _as_fake_vllm_config(module, make_pcp_config(pcp=1))
 
-    assert config._get_v2_model_runner_unsupported_features() == ["upstream feature"]
-    with pytest.raises(ValueError, match="upstream feature"):
+    assert config._get_v2_model_runner_unsupported_features() == ["dual batch overlap"]
+    with pytest.raises(ValueError, match="dual batch overlap"):
         config._validate_v2_model_runner()
 
 
-def test_invalid_pcp_preserves_upstream_pcp_rejection(make_pcp_config) -> None:
-    """Relaxing PCP before its HCU scope passes must remain impossible."""
+@pytest.mark.parametrize("pcp", [1, 2])
+def test_native_v2_reasons_preserve_identity_order_and_unknowns(
+    make_pcp_config, pcp
+) -> None:
+    """Delegate every native reason, even an unfamiliar or legacy-shaped one."""
+
+    reasons = [
+        "pipeline parallelism with external_launcher",
+        "speculative method 'medusa'",
+        "parallel drafting for EAGLE speculative decoding",
+        "heterogeneous-vocabulary draft models",
+        "dual batch overlap",
+        "future native reason",
+        "prefill context parallelism",
+    ]
+    expected = list(reasons)
+    module = _make_vllm_module(reasons)
+    assert patch_vllm_config.apply_to_module(module) is True
+    config = _as_fake_vllm_config(module, make_pcp_config(pcp=pcp))
+
+    assert config._get_v2_model_runner_unsupported_features() is reasons
+    assert reasons == expected
+    with pytest.raises(ValueError) as error:
+        config._validate_v2_model_runner()
+    assert str(error.value) == (
+        f"Model Runner V2 does not yet support: {', '.join(expected)}"
+    )
+    assert reasons == expected
+
+
+def test_invalid_pcp_still_fails_direct_hcu_scope(make_pcp_config) -> None:
+    """Native admission cannot replace the separate HCU topology gate."""
 
     module = _make_vllm_module()
     assert patch_vllm_config.apply_to_module(module) is True
@@ -613,11 +643,9 @@ def test_invalid_pcp_preserves_upstream_pcp_rejection(make_pcp_config) -> None:
         ),
     )
 
-    assert config._get_v2_model_runner_unsupported_features() == [
-        "prefill context parallelism"
-    ]
-    with pytest.raises(ValueError, match="prefill context parallelism"):
-        config._validate_v2_model_runner()
+    assert config._get_v2_model_runner_unsupported_features() == []
+    with pytest.raises(ValueError, match="does not support decode context parallelism"):
+        patch_vllm_config._validate_hcu_pcp_scope(config)
 
 
 def test_pcp_patch_rejects_v0251_wrapper_signature_drift() -> None:

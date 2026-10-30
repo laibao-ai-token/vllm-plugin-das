@@ -10,11 +10,15 @@ GQA FlashAttention plan from upstream PR #49564 to the HCU v0.25.1 sidecar.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from typing import NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
+
+if TYPE_CHECKING:
+    from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 
 import numpy as np
 import torch
 
+from vllm.config import CUDAGraphMode
 from vllm.distributed.parallel_state import get_dcp_group, get_pcp_group
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID, get_dcp_local_seq_lens
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
@@ -92,15 +96,30 @@ class HcuPCPManager:
         self,
         vllm_config: object,
         device: torch.device,
-        req_states: object,
-        block_tables: object,
+        req_states: object | None = None,
+        block_tables: object | None = None,
         *,
         pcp_group: object | None = None,
         dcp_group: object | None = None,
     ) -> None:
         parallel_config = vllm_config.parallel_config
         self.pcp_size = int(parallel_config.prefill_context_parallel_size)
+        self.pcp_world_size = self.pcp_size
         assert self.pcp_size > 1
+        if block_tables is None:
+            raise PatchCompatibilityError("HCU PCP requires block_tables")
+        # Native pcp_shard_decode_requests is an automatic capability, not a
+        # user request to select a layout. HCU keeps decode queries replicated,
+        # with rank 0 canonical KV ownership and the existing ownership metadata.
+        self.native_shard_decode_requests = getattr(
+            parallel_config,
+            "pcp_shard_decode_requests",
+            self.pcp_size > 1
+            and int(parallel_config.decode_context_parallel_size) == 1,
+        )
+        self.requested_shard_decode_requests: bool | None = None
+        self.shard_decode_requests = False
+        self.decode_strategy = "replicated"
         self.device = device
         self._pcp_group = pcp_group if pcp_group is not None else get_pcp_group()
         self.pcp_rank = int(self._pcp_group.rank_in_group)
@@ -505,9 +524,30 @@ class HcuPCPManager:
     def partition_batch(
         self,
         input_batch: InputBatch,
+        batch_desc: BatchExecutionDescriptor | int | None = None,
+        *,
         padded_num_tokens: int | None = None,
     ) -> InputBatch:
-        """Return a rank-local InputBatch without mutating the global batch."""
+        """Return a local batch; native NONE ignores descriptor graph padding.
+
+        Integer positional/keyword padding remains available to legacy callers.
+        Native graph descriptors are outside the HCU eager baseline; FULL request
+        padding in particular has no corresponding HCU row-layout implementation.
+        """
+        if batch_desc is not None:
+            if padded_num_tokens is not None:
+                raise PatchCompatibilityError(
+                    "PCP cannot combine batch_desc and legacy padded_num_tokens"
+                )
+            if isinstance(batch_desc, int) and not isinstance(batch_desc, bool):
+                padded_num_tokens = batch_desc
+            elif batch_desc.cg_mode != CUDAGraphMode.NONE:
+                raise PatchCompatibilityError(
+                    "HCU PCP native graph descriptors (including FULL request "
+                    "padding) are unsupported; use cg_mode=NONE"
+                )
+            # As in the native manager, NONE derives padding from the layout,
+            # irrespective of batch_desc.num_tokens or batch_desc.num_reqs.
 
         if (
             input_batch.num_draft_tokens
@@ -822,6 +862,51 @@ class HcuPCPManager:
             cu_num_logits_np=cu_num_logits_np,
             prompt_lens=None,
         )
+
+    def prepare_inputs_to_capture(self, input_batch: InputBatch) -> InputBatch:
+        """Stage five native dummy fields without changing the saved layout.
+
+        Validate all capacities and tensor contracts before the first copy so a
+        malformed dummy cannot leave a partially updated persistent input batch.
+        This staging contract also serves eager profiling; it enables no graphs.
+        """
+        num_reqs = input_batch.num_reqs_after_padding
+        num_tokens = input_batch.num_tokens_after_padding
+        if (
+            not isinstance(num_reqs, int)
+            or isinstance(num_reqs, bool)
+            or not 0 <= input_batch.num_reqs <= num_reqs <= self._max_local_reqs
+            or not isinstance(num_tokens, int)
+            or isinstance(num_tokens, bool)
+            or not 0 <= input_batch.num_tokens <= num_tokens <= self._max_local_tokens
+        ):
+            raise PatchCompatibilityError("PCP dummy batch exceeds its input buffer")
+        fields = (
+            ("input_ids", num_tokens),
+            ("positions", num_tokens),
+            ("is_padding", num_tokens),
+            ("query_start_loc", num_reqs + 1),
+            ("seq_lens", num_reqs),
+        )
+        for name, size in fields:
+            source = getattr(input_batch, name)
+            destination = getattr(self._input_buffers, name)
+            if (
+                not isinstance(source, torch.Tensor)
+                or tuple(source.shape) != (size,)
+                or source.dtype != destination.dtype
+                or source.device != destination.device
+            ):
+                raise PatchCompatibilityError(
+                    f"PCP dummy {name} does not match its input buffer contract"
+                )
+        staged = {
+            name: getattr(self._input_buffers, name)[:size].copy_(
+                getattr(input_batch, name)
+            )
+            for name, size in fields
+        }
+        return replace(input_batch, **staged)
 
     def prepare_attn(
         self, input_batch: InputBatch
@@ -1172,9 +1257,28 @@ def make_hcu_pcp_manager_cls(
             dcp_world_size: int = 1,
             dcp_rank: int = 0,
             cp_interleave: int = 1,
+            *,
+            shard_decode_requests: bool | None = None,
         ) -> None:
             parallel_config = vllm_config.parallel_config
             scheduler_config = vllm_config.scheduler_config
+            native_capability = getattr(
+                parallel_config,
+                "pcp_shard_decode_requests",
+                int(parallel_config.prefill_context_parallel_size) > 1
+                and int(parallel_config.decode_context_parallel_size) == 1,
+            )
+            if type(native_capability) is not bool or (
+                shard_decode_requests is not None
+                and (
+                    type(shard_decode_requests) is not bool
+                    or shard_decode_requests != native_capability
+                )
+            ):
+                raise PatchCompatibilityError(
+                    "official PCP shard_decode_requests must be the native "
+                    "boolean capability of the bound HCU config"
+                )
             expected = (
                 int(parallel_config.prefill_context_parallel_size),
                 int(parallel_config.decode_context_parallel_size),
@@ -1194,11 +1298,14 @@ def make_hcu_pcp_manager_cls(
                     "official PCP manager constructor arguments do not match "
                     f"the bound HCU config: actual={actual}, expected={expected}"
                 )
-            if req_states is None or block_tables is None:
+            if block_tables is None:
                 raise PatchCompatibilityError(
-                    "official PCP manager constructor omitted HCU runtime state"
+                    "official PCP manager constructor omitted HCU block_tables"
                 )
+            # req_states is retained for legacy callers; HCU never reads it.
+            # All partition positions and sequence ends come from InputBatch.
             super().__init__(vllm_config, device, req_states, block_tables)
+            self.requested_shard_decode_requests = shard_decode_requests
             if self.pcp_rank != int(pcp_rank) or self.dcp_rank != int(dcp_rank):
                 raise PatchCompatibilityError(
                     "official PCP manager ranks do not match HCU process groups"
