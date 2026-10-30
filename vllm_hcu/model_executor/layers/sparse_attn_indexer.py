@@ -6,6 +6,8 @@
 
 import torch
 
+from vllm_hcu.v1.attention.ops.indexer_candidates import validate_candidate_schema
+
 import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm._aiter_ops import rocm_aiter_ops
@@ -792,6 +794,9 @@ if current_platform.is_rocm():
         dcp_rank: int,
         dcp_world_size: int,
         cp_kv_cache_interleave_size: int,
+        candidate_blocks: torch.Tensor | None = None,
+        candidate_block_size: int = 0,
+        candidate_write: bool = False,
     ) -> None:
         rocm_aiter_sparse_attn_indexer_native(
             hidden_states,
@@ -811,6 +816,9 @@ if current_platform.is_rocm():
             dcp_rank=dcp_rank,
             dcp_world_size=dcp_world_size,
             cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
+            candidate_blocks=candidate_blocks,
+            candidate_block_size=candidate_block_size,
+            candidate_write=candidate_write,
         )
 
     def hcu_sparse_attn_indexer_fake(
@@ -831,6 +839,9 @@ if current_platform.is_rocm():
         dcp_rank: int,
         dcp_world_size: int,
         cp_kv_cache_interleave_size: int,
+        candidate_blocks: torch.Tensor | None = None,
+        candidate_block_size: int = 0,
+        candidate_write: bool = False,
     ) -> None:
         del (
             skip_k_cache_insert,
@@ -859,7 +870,7 @@ if current_platform.is_rocm():
     direct_register_custom_op(
         op_name="hcu_sparse_attn_indexer",
         op_func=hcu_sparse_attn_indexer,
-        mutates_args=["kv_cache", "topk_indices_buffer"],
+        mutates_args=["kv_cache", "topk_indices_buffer", "candidate_blocks"],
         fake_impl=hcu_sparse_attn_indexer_fake,
         dispatch_key=current_platform.dispatch_key,
         tags=(torch._C.Tag.cudagraph_unsafe,),
@@ -892,6 +903,9 @@ class SparseAttnIndexer(CustomOp):
         skip_k_cache_insert: bool = False,
         use_fp4_cache: bool = False,
         compress_ratio: int = 1,
+        candidate_blocks: torch.Tensor | None = None,
+        candidate_block_size: int = 0,
+        candidate_write: bool = False,
     ):
         super().__init__()
         self.k_cache = k_cache
@@ -916,6 +930,14 @@ class SparseAttnIndexer(CustomOp):
         self._cp_kv_cache_interleave_size: int | None = None
         self.pcp_world_size = parallel_config.prefill_context_parallel_size
         self.use_pcp = self.pcp_world_size > 1
+        validate_candidate_schema(
+            candidate_blocks, candidate_block_size, candidate_write,
+            topk_indices_buffer, use_fp4_cache, self.dcp_world_size,
+            self.pcp_world_size,
+        )
+        self.candidate_blocks = candidate_blocks
+        self.candidate_block_size = candidate_block_size
+        self.candidate_write = candidate_write
         if current_platform.is_cuda() and not has_deep_gemm():
             raise RuntimeError(
                 "Sparse Attention Indexer CUDA op requires DeepGEMM support in "
@@ -955,6 +977,8 @@ class SparseAttnIndexer(CustomOp):
         k: torch.Tensor | None,
         weights: torch.Tensor,
     ):
+        if self.candidate_blocks is not None:
+            raise NotImplementedError("HCU candidate filtering is implemented on ROCm only")
         # FP8 path: single tensor (per-token scale is folded into `weights`).
         # FP4 path: (values, scales) tuple with scales required by the kernel.
         if isinstance(q_quant, tuple):
@@ -1028,7 +1052,8 @@ class SparseAttnIndexer(CustomOp):
                     self, "cp_kv_cache_interleave_size", 1
                 ),
             )
-        if self.skip_k_cache_insert or not rocm_aiter_ops.is_enabled():
+        if (self.candidate_blocks is not None or self.skip_k_cache_insert
+                or not rocm_aiter_ops.is_enabled()):
             torch.ops.vllm.hcu_sparse_attn_indexer(
                 hidden_states,
                 _encode_layer_name(self.k_cache.prefix),
@@ -1047,6 +1072,9 @@ class SparseAttnIndexer(CustomOp):
                 getattr(self, "dcp_rank", 0),
                 getattr(self, "dcp_world_size", 1),
                 getattr(self, "cp_kv_cache_interleave_size", 1),
+                self.candidate_blocks,
+                self.candidate_block_size,
+                self.candidate_write,
             )
             return self.topk_indices_buffer
         if rocm_aiter_ops.is_enabled():
@@ -1088,6 +1116,8 @@ class V32SparseAttnIndexer(SparseAttnIndexer):
         assert isinstance(q_quant, torch.Tensor), (
             "HCU sparse_attn_indexer expects a single FP8 q_quant tensor"
         )
+        if self.candidate_blocks is not None:
+            return super().forward_hip(hidden_states, q_quant, k, weights)
         dcp_rank = self.dcp_rank
         dcp_world_size = self.dcp_world_size
         cp_kv_cache_interleave_size = self.cp_kv_cache_interleave_size
