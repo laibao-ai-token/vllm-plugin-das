@@ -132,8 +132,15 @@ def load_manager(rank=0, config=None, path=None):
     execute_nodes(HCU_SCOPE_SOURCE, scope, strip_imports=True)
     source = Path(path or SOURCE_PATH).read_text()
     tree = ast.parse(source)
-    names = [n.name for n in tree.body if isinstance(n, (ast.ClassDef, ast.FunctionDef))]
-    execute_nodes(source, scope, names=names)
+    # Keep the actual sampling sentinel assignment in source order: its value
+    # is captured as the class method's default while the class is defined.
+    nodes = [n for n in tree.body if isinstance(n, (ast.ClassDef, ast.FunctionDef))
+             or (isinstance(n, ast.Assign) and any(
+                 isinstance(target, ast.Name) and target.id == "_AUX_HIDDEN_UNSET"
+                 for target in n.targets))]
+    module = ast.Module(body=[ast.ImportFrom(module="__future__", names=[
+        ast.alias(name="annotations")], level=0)] + nodes, type_ignores=[])
+    exec(compile(ast.fix_missing_locations(module), "<pinned-source-ast>", "exec"), scope)
     # Every factory call supplies the custom cls; resolve only its unused
     # default-class expression here without importing the native package.
     scope["PCPManager"] = scope["HcuPCPManager"]

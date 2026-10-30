@@ -150,19 +150,25 @@ def pcp_runner_module(monkeypatch: pytest.MonkeyPatch):
         def sample_tokens(self, grammar_output):
             events.append("super.sample_tokens")
             assert grammar_output == "grammar"
-            # Upstream 0.28.1 restores PCP only on the final PP stage.
-            # The non-final stage receives the sampled tokens first.
+            manager = getattr(self, "pcp_manager", None)
+            # Native MRV2 receives with the manager's global batch on non-final
+            # PP ranks and restores hidden plus auxiliary states on the last.
             if getattr(self, "is_last_pp_rank", True) is False:
                 assert self.execute_model_state.hidden_states is None
                 assert self.execute_model_state.input_batch is self.expected_batch
+                if manager is not None:
+                    assert manager.global_batch is self.expected_batch
                 return "received"
-            manager = getattr(self, "pcp_manager", None)
             if manager is not None:
-                hidden_states, input_batch = manager.restore_for_sampling(
-                    self.execute_model_state.hidden_states
+                hidden_states, aux_hidden_states, input_batch = (
+                    manager.restore_for_sampling(
+                        self.execute_model_state.hidden_states,
+                        self.execute_model_state.aux_hidden_states,
+                    )
                 )
                 self.execute_model_state = self.execute_model_state._replace(
                     hidden_states=hidden_states,
+                    aux_hidden_states=aux_hidden_states,
                     input_batch=input_batch,
                 )
             assert self.execute_model_state.hidden_states is self.expected_hidden
@@ -207,6 +213,7 @@ def _config(pcp_size: int, *, speculative: bool = True) -> object:
 class _ExecuteModelState(NamedTuple):
     input_batch: object
     hidden_states: object
+    aux_hidden_states: object = None
 
 
 class _MTPExecuteModelState(NamedTuple):
@@ -249,10 +256,11 @@ def test_pcp_runner_orders_lifecycle_and_restores_sampling_state(
             assert input_batch is local_batch
             return "local-blocks", "gathered-slots"
 
-        def restore_for_sampling(self, hidden_states):
+        def restore_for_sampling(self, hidden_states, aux_hidden_states):
             events.append("restore_for_sampling")
             assert hidden_states is local_hidden
-            return global_hidden, global_batch
+            assert aux_hidden_states is None
+            return global_hidden, None, global_batch
 
     manager = Manager()
 
@@ -363,9 +371,10 @@ def test_pcp_runner_replaces_immutable_execute_model_state(
     local_hidden = object()
 
     class Manager:
-        def restore_for_sampling(self, hidden_states):
+        def restore_for_sampling(self, hidden_states, aux_hidden_states):
             assert hidden_states is local_hidden
-            return global_hidden, global_batch
+            assert aux_hidden_states is None
+            return global_hidden, None, global_batch
 
     runner = runner_module.HcuGPUModelRunnerV2(_config(2), "hcu:0")
     runner.pcp_manager = Manager()
@@ -396,10 +405,11 @@ def test_pcp_mtp_rebuilds_global_drafter_attention_state(
     local_hidden = object()
 
     class Manager:
-        def restore_for_sampling(self, hidden_states):
+        def restore_for_sampling(self, hidden_states, aux_hidden_states):
             events.append("restore_for_sampling")
             assert hidden_states is local_hidden
-            return global_hidden, global_batch
+            assert aux_hidden_states is None
+            return global_hidden, None, global_batch
 
         def prepare_global_attn(self):
             events.append("pcp.prepare_global_attn")
@@ -506,17 +516,22 @@ def test_pp_final_stage_restores_hidden_once() -> None:
 def test_pp_nonfinal_restores_global_batch_before_receive(
     pcp_runner_module, num_speculative_steps,
 ) -> None:
-    """The 0.28.1 upstream non-final PP path does not restore PCP itself."""
+    """Early HCU restore and native PP receive must use the same global batch."""
 
     runner_module, events = pcp_runner_module
     global_batch = object()
     local_batch = object()
 
     class Manager:
-        def restore_for_sampling(self, hidden_states):
+        @property
+        def global_batch(self):
+            return global_batch
+
+        def restore_for_sampling(self, hidden_states, aux_hidden_states):
             events.append("restore_for_sampling")
             assert hidden_states is None
-            return None, global_batch
+            assert aux_hidden_states is None
+            return None, None, global_batch
 
     runner = runner_module.HcuGPUModelRunnerV2(
         _config(4, speculative=bool(num_speculative_steps)), "hcu:0"
@@ -565,10 +580,11 @@ def test_pp_final_mtp_preserves_unequal_draft_counts_and_global_metadata(
     global_hidden = object()
 
     class Manager:
-        def restore_for_sampling(self, hidden_states):
+        def restore_for_sampling(self, hidden_states, aux_hidden_states):
             events.append("restore_for_sampling")
             assert hidden_states is local_hidden
-            return global_hidden, global_batch
+            assert aux_hidden_states is None
+            return global_hidden, None, global_batch
 
         def prepare_global_attn(self):
             events.append("pcp.prepare_global_attn")

@@ -29,6 +29,9 @@ from vllm_hcu.patch.platform.core_fix.patch_vllm_config import (
 )
 
 
+_AUX_HIDDEN_UNSET = object()
+
+
 @dataclass(frozen=True)
 class RankSegment:
     """Half-open token interval assigned to one PCP rank-local row."""
@@ -319,6 +322,11 @@ class HcuPCPManager:
     @property
     def input_buffers(self) -> InputBuffers:
         return self._input_buffers
+
+    @property
+    def global_batch(self) -> InputBatch:
+        assert self._global_batch is not None
+        return self._global_batch
 
     @staticmethod
     def _reorder_segments(
@@ -1212,17 +1220,45 @@ class HcuPCPManager:
         )
 
     def restore_for_sampling(
-        self, hidden_states: torch.Tensor | None
-    ) -> tuple[torch.Tensor | None, InputBatch]:
-        """Restore the global batch; gather hidden states only on final PP."""
+        self,
+        hidden_states: torch.Tensor | None,
+        aux_hidden_states: list[torch.Tensor] | None | object = _AUX_HIDDEN_UNSET,
+    ) -> (
+        tuple[torch.Tensor | None, InputBatch]
+        | tuple[torch.Tensor | None, list[torch.Tensor] | None, InputBatch]
+    ):
+        """Restore one sampling view, including native auxiliary hidden states.
 
+        Omitted auxiliary state keeps the older HCU two-result interface.
+        Explicit None/list follows the native MRV2 three-result interface.
+        Non-final PP may pass None for hidden states without a collective.
+        """
         assert self._global_batch is not None
+        legacy = aux_hidden_states is _AUX_HIDDEN_UNSET
+        if not legacy and aux_hidden_states is not None:
+            if not isinstance(aux_hidden_states, list) or not all(
+                isinstance(states, torch.Tensor) and states.ndim > 0
+                for states in aux_hidden_states
+            ):
+                raise TypeError("PCP auxiliary hidden states must be a list of row tensors or None")
+            if isinstance(hidden_states, torch.Tensor) and any(
+                states.shape[0] != hidden_states.shape[0]
+                or states.device != hidden_states.device
+                for states in aux_hidden_states
+            ):
+                raise ValueError("PCP auxiliary hidden rows/device must match the local hidden states")
         restored = (
             None
             if hidden_states is None
             else self.restore_hidden_states(hidden_states)
         )
-        return restored, self._global_batch
+        if legacy:
+            return restored, self._global_batch
+        restored_aux = (
+            None if aux_hidden_states is None else
+            [self.restore_hidden_states(states) for states in aux_hidden_states]
+        )
+        return restored, restored_aux, self._global_batch
 
 
 def maybe_build_pcp_manager(

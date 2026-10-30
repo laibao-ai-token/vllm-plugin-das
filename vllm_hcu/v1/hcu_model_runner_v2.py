@@ -708,12 +708,19 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
         if use_replicated_mtp_batch or restore_nonfinal_pp_batch:
             (
                 restored_hidden_states,
+                restored_aux_hidden_states,
                 restored_input_batch,
-            ) = self.pcp_manager.restore_for_sampling(execute_model_state.hidden_states)
-            execute_model_state = execute_model_state._replace(
+            ) = self.pcp_manager.restore_for_sampling(
+                execute_model_state.hidden_states,
+                getattr(execute_model_state, "aux_hidden_states", None),
+            )
+            restored_fields = dict(
                 hidden_states=restored_hidden_states,
                 input_batch=restored_input_batch,
             )
+            if hasattr(execute_model_state, "aux_hidden_states"):
+                restored_fields["aux_hidden_states"] = restored_aux_hidden_states
+            execute_model_state = execute_model_state._replace(**restored_fields)
             self.execute_model_state = execute_model_state
         input_batch = (
             None if execute_model_state is None else execute_model_state.input_batch
