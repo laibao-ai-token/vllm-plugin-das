@@ -754,8 +754,8 @@ def test_indexer_metadata_adapter_propagates_pcp_world_size():
     )
 
     def split_chunks(
-        seq_lens_cpu,
-        query_lens_cpu,
+        compressed_seq_lens_cpu,
+        prefill_query_lens_cpu,
         workspace_size,
         max_logits_bytes,
         request_offset=0,
@@ -779,8 +779,8 @@ def test_indexer_metadata_adapter_propagates_pcp_world_size():
         ):
             return SimpleNamespace(decode=None)
 
+    Builder._split_indexer_prefill_chunks = staticmethod(split_chunks)
     module = ModuleType(adapter.TARGET_MODULE)
-    module.split_indexer_prefill_chunks = split_chunks
     module.split_decodes_and_prefills = split_batch
     module.DeepseekV32IndexerMetadataBuilder = Builder
     module.current_platform = SimpleNamespace(is_rocm=lambda: False)
@@ -809,15 +809,15 @@ def test_rocm_indexer_metadata_adapter_skips_unused_lightop_schedule(
     )
 
     def split_chunks(
-        seq_lens_cpu,
-        query_lens_cpu,
+        compressed_seq_lens_cpu,
+        prefill_query_lens_cpu,
         workspace_size,
         max_logits_bytes,
         request_offset=0,
     ):
         del (
-            seq_lens_cpu,
-            query_lens_cpu,
+            compressed_seq_lens_cpu,
+            prefill_query_lens_cpu,
             workspace_size,
             max_logits_bytes,
             request_offset,
@@ -855,8 +855,8 @@ def test_rocm_indexer_metadata_adapter_skips_unused_lightop_schedule(
                 )
             )
 
+    Builder._split_indexer_prefill_chunks = staticmethod(split_chunks)
     module = ModuleType(adapter.TARGET_MODULE)
-    module.split_indexer_prefill_chunks = split_chunks
     module.split_decodes_and_prefills = split_batch
     module.DeepseekV32IndexerMetadataBuilder = Builder
     module.current_platform = SimpleNamespace(is_rocm=lambda: True)

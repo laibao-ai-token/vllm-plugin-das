@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import functools
+import inspect
 from types import ModuleType
 
 from ._common import (
@@ -19,7 +20,7 @@ from ._common import (
 TARGET_MODULE = "vllm.v1.attention.backends.mla.indexer"
 PATCH_ID = "worker.op_opt.mla.indexer_hcu"
 TARGETS = (
-    f"{TARGET_MODULE}.split_indexer_prefill_chunks",
+    f"{TARGET_MODULE}.DeepseekV32IndexerMetadataBuilder._split_indexer_prefill_chunks",
     f"{TARGET_MODULE}.split_decodes_and_prefills",
     f"{TARGET_MODULE}.DeepseekV32IndexerMetadataBuilder.build",
 )
@@ -30,19 +31,34 @@ _WRAPPER = "_vllm_hcu_mla_indexer_wrapper"
 def apply_to_module(module: ModuleType) -> bool:
     indexer = load_exact_module(TARGET_MODULE, module)
     builder_cls = require_class(indexer, "DeepseekV32IndexerMetadataBuilder", f"{TARGET_MODULE}.DeepseekV32IndexerMetadataBuilder")
+    chunk_descriptor = vars(builder_cls).get("_split_indexer_prefill_chunks")
+    if not isinstance(chunk_descriptor, staticmethod):
+        raise PatchCompatibilityError(
+            f"required HCU patch target {TARGETS[0]} must be an own staticmethod"
+        )
+    split_chunks = chunk_descriptor.__func__
+    require_exact_signature(
+        split_chunks, TARGETS[0],
+        positional=("compressed_seq_lens_cpu", "prefill_query_lens_cpu", "workspace_size", "max_logits_bytes", "request_offset"),
+        defaults={"request_offset": 0},
+    )
+    offset_default = inspect.signature(split_chunks).parameters["request_offset"].default
+    if type(offset_default) is not int or offset_default != 0:
+        raise PatchCompatibilityError(
+            f"required HCU patch target {TARGETS[0]} must default request_offset to int 0"
+        )
     wrapped = (
-        (indexer, "split_indexer_prefill_chunks", TARGETS[0], _WRAPPER),
+        (builder_cls, "_split_indexer_prefill_chunks", TARGETS[0], _WRAPPER),
         (indexer, "split_decodes_and_prefills", TARGETS[1], _WRAPPER),
         (builder_cls, "build", TARGETS[2], _WRAPPER),
     )
     if already_applied(indexer, _MARKER, wrapped):
         return False
-    split_chunks = require_callable(indexer, "split_indexer_prefill_chunks", TARGETS[0])
-    require_exact_signature(
-        split_chunks, TARGETS[0],
-        positional=("seq_lens_cpu", "query_lens_cpu", "workspace_size", "max_logits_bytes", "request_offset"),
-        defaults={"request_offset": 0},
-    )
+    if any(getattr(require_callable(owner, name, target), marker, False)
+           for owner, name, target, marker in wrapped):
+        raise PatchCompatibilityError(
+            "required HCU indexer target is wrapped without its module marker"
+        )
     split_batch = require_callable(indexer, "split_decodes_and_prefills", TARGETS[1])
     require_exact_signature(
         split_batch, TARGETS[1],
@@ -58,9 +74,9 @@ def apply_to_module(module: ModuleType) -> bool:
     )
 
     @functools.wraps(split_chunks)
-    def hcu_split_chunks(seq_lens_cpu, query_lens_cpu, workspace_size,
+    def hcu_split_chunks(compressed_seq_lens_cpu, prefill_query_lens_cpu, workspace_size,
                          max_logits_bytes, request_offset=0):
-        chunks = split_chunks(seq_lens_cpu, query_lens_cpu, workspace_size,
+        chunks = split_chunks(compressed_seq_lens_cpu, prefill_query_lens_cpu, workspace_size,
                               max_logits_bytes, request_offset)
         return [
             (req_slice, query_slice)
@@ -144,10 +160,10 @@ def apply_to_module(module: ModuleType) -> bool:
 
     for function in (hcu_split_chunks, hcu_split_batch, hcu_build):
         setattr(function, _WRAPPER, True)
-    setattr(indexer, "_vllm_hcu_original_split_indexer_prefill_chunks", split_chunks)
+    setattr(builder_cls, "_vllm_hcu_original_split_indexer_prefill_chunks", staticmethod(split_chunks))
     setattr(indexer, "_vllm_hcu_original_split_decodes_and_prefills", split_batch)
     setattr(builder_cls, "_vllm_hcu_original_build", build)
-    setattr(indexer, "split_indexer_prefill_chunks", hcu_split_chunks)
+    setattr(builder_cls, "_split_indexer_prefill_chunks", staticmethod(hcu_split_chunks))
     setattr(indexer, "split_decodes_and_prefills", hcu_split_batch)
     setattr(builder_cls, "build", hcu_build)
     setattr(indexer, _MARKER, True)

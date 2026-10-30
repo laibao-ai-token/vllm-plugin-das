@@ -44,7 +44,7 @@ def test_query_subchunks_gather_k_before_skipping_empty_pcp_rows(
     query_lens = torch.tensor([16, 16], dtype=torch.int32)
     query_start = torch.tensor([0, 16, 32], dtype=torch.int32)
     block_table = torch.tensor([[0], [1]], dtype=torch.int32)
-    splits = indexer.split_indexer_prefill_chunks(
+    splits = indexer.DeepseekV32IndexerMetadataBuilder._split_indexer_prefill_chunks(
         compressed, query_lens, workspace_size=8, max_logits_bytes=8 * 4,
     )
     chunks = [indexer.build_prefill_chunk_metadata(
