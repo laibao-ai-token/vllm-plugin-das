@@ -65,6 +65,33 @@ def apply_to_module(module: ModuleType) -> bool:
         x_and_scale_quanted=None,
     ):
         if x_and_scale_quanted is None:
+            if (
+                isinstance(x, torch.Tensor)
+                and x.ndim >= 2
+                and prod(x.shape[:-1]) == 0
+                and supports_quanted_inputs(self)
+            ):
+                # Keep ColumnParallelLinear and Engram's input/output gathers
+                # running. Only skip local quantization/GEMM for zero rows.
+                weight, weight_scale, _, _ = self._get_layer_params(layer)
+                if (
+                    not isinstance(weight, torch.Tensor)
+                    or weight.ndim != 2
+                    or x.shape[-1] != weight.shape[0]
+                ):
+                    raise ValueError(
+                        "empty Channel-FP8 input must match the weight K dimension"
+                    )
+                out_dtype = x.dtype if self.config.out_dtype is None else self.config.out_dtype
+                return self.apply_scaled_mm(
+                    A=x.reshape(0, x.shape[-1]).to(dtype=weight.dtype),
+                    B=weight,
+                    As=torch.empty((0, 1), dtype=torch.float32, device=x.device),
+                    Bs=weight_scale,
+                    out_dtype=out_dtype,
+                    bias=bias,
+                    output_shape=[*x.shape[:-1], weight.shape[1]],
+                )
             return original(self, layer, x, bias)
         if not supports_quanted_inputs(self):
             raise RuntimeError(

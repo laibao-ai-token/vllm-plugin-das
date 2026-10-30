@@ -1077,9 +1077,9 @@ def test_layout_and_shape_errors_fail_closed_before_triton(
     elif case == "b-rank":
         kwargs["B"] = kwargs["B"].unsqueeze(0)
     elif case == "zero-dimension":
-        kwargs["A"] = torch.empty((0, k), dtype=_FP8_DTYPE)
-        kwargs["As"] = torch.empty((0, 1), dtype=torch.float32)
-        kwargs["output_shape"] = (0, n)
+        # Zero token rows are valid; an empty reduction dimension still fails.
+        kwargs["A"] = torch.empty((m, 0), dtype=_FP8_DTYPE)
+        kwargs["B"] = torch.empty((0, n), dtype=_FP8_DTYPE)
     elif case == "k-mismatch":
         kwargs["B"] = _column_major_weight(k + 1, n)
     elif case == "a-layout":

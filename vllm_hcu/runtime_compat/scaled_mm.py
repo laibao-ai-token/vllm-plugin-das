@@ -439,10 +439,10 @@ def install_fp8_scaled_mm_compat(module: ModuleType | None = None) -> None:
             raise ValueError("channelwise FP8 scaled-mm requires 2D A and B")
 
         m, k = A.shape
-        if m <= 0 or k <= 0 or B.shape[0] != k or B.shape[1] <= 0:
+        if k <= 0 or B.shape[0] != k or B.shape[1] <= 0:
             raise ValueError(
                 "channelwise FP8 scaled-mm requires A=[M,K], B=[K,N] with "
-                "positive dimensions"
+                "positive dimensions for K and N"
             )
         n = B.shape[1]
         if not A.is_contiguous():
@@ -503,6 +503,12 @@ def install_fp8_scaled_mm_compat(module: ModuleType | None = None) -> None:
                     "channelwise FP8 bias must be floating [N] on the operand "
                     "device"
                 )
+
+        if m == 0:
+            # All input/layout/scale/output contracts above still apply. Empty
+            # local matmuls must not launch the positive-M vendor/Triton ABI;
+            # callers retain responsibility for their surrounding collectives.
+            return torch.empty(tuple(output_shape), dtype=out_dtype, device=A.device)
 
         output = channel_fp8_custom_op(
             A,
