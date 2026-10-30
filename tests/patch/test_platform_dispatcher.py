@@ -82,6 +82,7 @@ def test_platform_core_inventory_is_explicit_and_ordered():
             "vllm.distributed.nixl_utils",
         ),
         ("platform.core_fix.hcu_config.engine_args", "vllm.engine.arg_utils"),
+        ("platform.core_fix.parallel_config.hcu_replace_aliases", "vllm.config.utils"),
         (
             "platform.core_fix.hcu_config.compilation_cudagraph",
             "vllm.config.compilation",

@@ -348,6 +348,7 @@ def set_hcu_config(
             additional = dict(additional)
             vllm_config["additional_config"] = additional
         write_hcu_config(additional, normalized)
+        bind_hcu_parallel_aliases(vllm_config)
         return normalized
 
     if not hasattr(vllm_config, "additional_config"):
@@ -362,6 +363,7 @@ def set_hcu_config(
         additional = dict(additional)
         setattr(vllm_config, "additional_config", additional)
     write_hcu_config(additional, normalized)
+    bind_hcu_parallel_aliases(vllm_config)
     return normalized
 
 
@@ -388,6 +390,22 @@ def bind_hcu_eplb_config(vllm_config: object) -> None:
             parallel_config[attribute] = value
         else:
             setattr(parallel_config, attribute, value)
+
+
+
+def bind_hcu_parallel_aliases(vllm_config: object) -> None:
+    """Mirror the authoritative sidecar to the five audited ParallelConfig aliases."""
+    parallel = (vllm_config.get("parallel_config") if isinstance(vllm_config, Mapping)
+                else getattr(vllm_config, "parallel_config", None))
+    if parallel is None:
+        return
+    # Keep EPLB alias ownership in its existing single implementation.
+    bind_hcu_eplb_config(vllm_config)
+    value = get_hcu_config(vllm_config).deepep_auto
+    if isinstance(parallel, MutableMapping):
+        parallel["_vllm_hcu_deepep_auto"] = value
+    else:
+        setattr(parallel, "_vllm_hcu_deepep_auto", value)
 
 
 def pop_hcu_feature_kwargs(
@@ -417,6 +435,7 @@ def pop_hcu_feature_kwargs(
 __all__ = [
     "HcuFeatureConfig",
     "bind_hcu_eplb_config",
+    "bind_hcu_parallel_aliases",
     "get_hcu_config",
     "normalize_hcu_moe_backend",
     "pop_hcu_feature_kwargs",
