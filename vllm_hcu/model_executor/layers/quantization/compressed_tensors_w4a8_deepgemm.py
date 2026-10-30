@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-"""Packed compressed-tensors INT4/INT8 MoE for fixed DeepEP HT on HCU.
+"""Packed compressed-tensors INT4/INT8 MoE for fixed DeepEP HT/LL on HCU.
 
 CT stores unsigned (q + 8), low-nibble-first INT4 and ordinary channel scales.
 HIPC expects signed high-nibble-first bytes and scales in its INT8 (q * 16)
@@ -42,7 +42,7 @@ def _hipc_channel_scale(scale: torch.Tensor) -> torch.Tensor:
 
 
 def validate_hcu_w4a8(weight_quant, input_quant, moe) -> None:
-    """Fail closed outside the initial channel-W4A8, fixed-HT contract."""
+    """Fail closed outside channel-W4A8 with a fixed HT/LL or explicit AG-RS path."""
     if not (
         weight_quant.num_bits == 4
         and weight_quant.type == "int"
@@ -59,17 +59,18 @@ def validate_hcu_w4a8(weight_quant, input_quant, moe) -> None:
     ):
         raise ValueError("HCU DeepGEMM W4A8 requires symmetric channel INT4 and dynamic token INT8")
     parallel = moe.moe_parallel_config
-    # Contiguous HIPC experts support fixed HT and an explicitly configured
+    # HIPC experts support fixed HT/LL and an explicitly configured
     # AG-RS prepare/finalize path. The paired community core does not itself
     # switch DSpark to AG-RS; draft EP/groups/backend integration is separate.
     # Accepting the expert method here does not validate that full deployment.
     if not parallel.use_ep or parallel.all2all_backend not in (
         "deepep_high_throughput",
+        "deepep_low_latency",
         "allgather_reducescatter",
     ):
         raise ValueError(
             "HCU CT W4A8 requires EP with all2all_backend "
-            f"'deepep_high_throughput' (target) or 'allgather_reducescatter' "
+            f"'deepep_high_throughput', 'deepep_low_latency' or 'allgather_reducescatter' "
             f"(draft), got {parallel.all2all_backend!r}"
         )
     if moe.moe_backend != "deep_gemm":
@@ -164,8 +165,10 @@ class HCUCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
         from vllm.model_executor.layers.fused_moe import modular_kernel as mk
         from vllm.model_executor.layers.fused_moe.all2all_utils import maybe_make_prepare_finalize
         from vllm_hcu.model_executor.layers.quantization.slimquant_w4a8_deepgemm_runtime import (
+            DeepEPDeepGemmW4A8BatchedExperts,
             DeepEPDeepGemmW4A8ContiguousExperts,
             pack_w4a8_moe_hipc_weight,
+            view_w4a8_moe_hipc_weight_n32_layout,
         )
 
         # Convert one projection at a time; retain ONE resident weight owner.
@@ -192,14 +195,55 @@ class HCUCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
             allow_new_interface=True, use_monolithic=False,
         )
         if prepare is None:
-            # DeepEP HT (target) or naive AG-RS (DSpark draft) prepare/finalize.
+            # Fixed DeepEP HT/LL or naive AG-RS (DSpark draft) prepare/finalize.
             raise RuntimeError(
                 "HCU CT W4A8 did not construct a prepare/finalize for "
                 f"all2all_backend={self.moe.moe_parallel_config.all2all_backend!r}"
             )
-        experts = DeepEPDeepGemmW4A8ContiguousExperts(self.moe, self.moe_quant_config)
-        experts._deepgemm_w13 = layer.w13_weight_packed
-        experts._deepgemm_w2 = layer.w2_weight_packed
+        if self.moe.moe_parallel_config.all2all_backend == "deepep_low_latency":
+            from vllm.model_executor.layers.fused_moe.prepare_finalize.deepep_ll import (
+                DeepEPLLPrepareAndFinalize,
+            )
+
+            # Fixed LL must pair batched dispatch with masked N32 experts. Never
+            # accept an auto/HT delegate or silently dispatch unquantized data.
+            if (
+                not isinstance(prepare, DeepEPLLPrepareAndFinalize)
+                or not getattr(prepare, "use_int8_dispatch", False)
+                or getattr(prepare, "use_fp8_dispatch", False)
+                or getattr(prepare, "use_ue8m0_dispatch", False)
+            ):
+                raise RuntimeError("HCU CT W4A8 requires fixed DeepEP LL INT8 prepare/finalize")
+            capacity = prepare.max_num_tokens_per_rank()
+            dispatchers = prepare.num_dispatchers()
+            if (
+                type(capacity) is not int or capacity <= 0
+                or type(dispatchers) is not int or dispatchers <= 0
+            ):
+                raise RuntimeError("HCU CT W4A8 LL requires positive token capacity and dispatchers")
+            experts = DeepEPDeepGemmW4A8BatchedExperts(
+                self.moe, self.moe_quant_config, capacity, dispatchers,
+            )
+            # The checkpoint scale dimensions describe the loaded matrices.
+            experts._hcu_logical_n = layer.w13_weight_scale.size(1)
+            experts._hcu_logical_k = layer.w2_weight_scale.size(1)
+            owners = (layer.w13_weight_packed, layer.w2_weight_packed)
+            views = tuple(view_w4a8_moe_hipc_weight_n32_layout(w) for w in owners)
+            if any(
+                view.dtype != torch.int8
+                or tuple(view.shape) != (
+                    owner.size(0), owner.size(2) // 32, owner.size(1) // 32, 4, 32, 8,
+                )
+                or view.data_ptr() != owner.data_ptr()
+                or view.untyped_storage().data_ptr() != owner.untyped_storage().data_ptr()
+                for view, owner in zip(views, owners)
+            ):
+                raise RuntimeError("HCU CT W4A8 LL N32 views must alias packed weight storage")
+            experts._deepgemm_w13, experts._deepgemm_w2 = views
+        else:
+            experts = DeepEPDeepGemmW4A8ContiguousExperts(self.moe, self.moe_quant_config)
+            experts._deepgemm_w13 = layer.w13_weight_packed
+            experts._deepgemm_w2 = layer.w2_weight_packed
         self.moe_kernel = mk.FusedMoEKernel(prepare, experts)
         self._packed_signature = self._signature(layer)
         self._layout_state = "ready"
