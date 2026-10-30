@@ -19,7 +19,7 @@ from ._common import (
 TARGET_MODULE = "vllm.envs"
 PATCH_ID = "platform.core_fix.envs"
 TARGETS = (
-    "vllm.envs.validate_environ",
+    "vllm.platforms.interface.Platform.validate_environ",
     "vllm.envs.environment_variables.VLLM_ROCM_USE_AITER_MOE",
     "vllm.envs.environment_variables.VLLM_USE_V2_MODEL_RUNNER",
 )
@@ -52,22 +52,27 @@ def apply_to_module(module: ModuleType) -> bool:
             "vllm.envs.environment_variables['VLLM_USE_V2_MODEL_RUNNER'] is missing"
         )
 
-    original_validate = require_callable(
-        envs, "validate_environ", "vllm.envs.validate_environ"
-    )
-    require_positional_signature(
-        original_validate,
-        "vllm.envs.validate_environ",
-        ("hard_fail",),
-    )
+    platform_module = load_exact_module("vllm.platforms.interface", None)
+    platform = getattr(platform_module, "Platform", None)
+    if not isinstance(platform, type):
+        raise PatchCompatibilityError(
+            "required HCU patch target vllm.platforms.interface.Platform is missing"
+        )
+    original_validate = require_callable(platform, "validate_environ", TARGETS[0])
+    require_positional_signature(original_validate, TARGETS[0], ("hard_fail",))
+    original_descriptor = vars(platform).get("validate_environ")
+    if not isinstance(original_descriptor, classmethod):
+        raise PatchCompatibilityError(
+            f"required HCU patch target {TARGETS[0]} must be a classmethod"
+        )
     env_logger = getattr(envs, "logger", None)
     if not callable(getattr(env_logger, "warning", None)):
         raise PatchCompatibilityError(
             "required HCU patch target vllm.envs.logger.warning is missing"
         )
 
-    @functools.wraps(original_validate)
-    def hcu_validate_environ(hard_fail: bool) -> None:
+    @functools.wraps(original_descriptor.__func__)
+    def hcu_validate_environ(cls, hard_fail: bool) -> None:
         for name in os.environ:
             if not name.startswith("VLLM_"):
                 continue
@@ -103,10 +108,10 @@ def apply_to_module(module: ModuleType) -> bool:
     if callable(cache_clear):
         cache_clear()
 
-    setattr(envs, "_vllm_hcu_original_validate_environ", original_validate)
+    setattr(platform, "_vllm_hcu_original_validate_environ", original_descriptor)
     setattr(envs, "_vllm_hcu_original_aiter_moe_getter", old_aiter_getter)
     envs._vllm_hcu_original_model_runner_v2_getter = original_runner_getter
-    setattr(envs, "validate_environ", hcu_validate_environ)
+    setattr(platform, "validate_environ", classmethod(hcu_validate_environ))
     setattr(envs, _MARKER, True)
     return True
 

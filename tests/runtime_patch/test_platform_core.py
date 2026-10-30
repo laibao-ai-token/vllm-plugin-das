@@ -53,9 +53,16 @@ def test_envs_allows_only_hcu_namespace_and_defaults_aiter_off(
     _clear_vllm_environment(monkeypatch)
     logger = logging.getLogger("test.hcu.envs")
 
-    def original_validate(hard_fail):
-        raise AssertionError("the upstream validator should have been replaced")
+    class Platform:
+        @classmethod
+        def validate_environ(cls, hard_fail):
+            raise AssertionError("the upstream validator should have been replaced")
 
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.platforms.interface",
+        _module("vllm.platforms.interface", Platform=Platform),
+    )
     module = _module(
         patch_envs.TARGET_MODULE,
         environment_variables={
@@ -63,7 +70,6 @@ def test_envs_allows_only_hcu_namespace_and_defaults_aiter_off(
             "VLLM_ROCM_USE_AITER_MOE": lambda: True,
             "VLLM_USE_V2_MODEL_RUNNER": lambda: None,
         },
-        validate_environ=original_validate,
         logger=logger,
     )
 
@@ -76,29 +82,38 @@ def test_envs_allows_only_hcu_namespace_and_defaults_aiter_off(
 
     monkeypatch.setenv("VLLM_HCU_FEATURE", "1")
     monkeypatch.setenv("VLLM_KNOWN", "1")
-    module.validate_environ(hard_fail=True)
+    Platform.validate_environ(hard_fail=True)
 
     monkeypatch.setenv("VLLM_NOT_HCU", "1")
     with pytest.raises(ValueError, match="VLLM_NOT_HCU"):
-        module.validate_environ(hard_fail=True)
+        Platform.validate_environ(hard_fail=True)
     monkeypatch.delenv("VLLM_NOT_HCU")
     monkeypatch.setenv("VLLM_HCU", "1")
     with caplog.at_level(logging.WARNING, logger="test.hcu.envs"):
-        module.validate_environ(hard_fail=False)
+        Platform.validate_environ(hard_fail=False)
     assert "VLLM_HCU" in caplog.text
 
     record = PATCH_REGISTRY.get(patch_envs.PATCH_ID)
     assert record is not None and record.status is PatchStatus.APPLIED
 
 
-def test_envs_rejects_signature_drift_and_latches_failure():
+def test_envs_rejects_signature_drift_and_latches_failure(monkeypatch):
+    class Platform:
+        @classmethod
+        def validate_environ(cls):
+            return None
+
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.platforms.interface",
+        _module("vllm.platforms.interface", Platform=Platform),
+    )
     module = _module(
         patch_envs.TARGET_MODULE,
         environment_variables={
             "VLLM_ROCM_USE_AITER_MOE": lambda: True,
             "VLLM_USE_V2_MODEL_RUNNER": lambda: None,
         },
-        validate_environ=lambda: None,
         logger=logging.getLogger("test.hcu.bad_envs"),
     )
     with pytest.raises(PatchCompatibilityError, match="incompatible signature"):
