@@ -15,6 +15,9 @@ from vllm_hcu.deepseek_v4_runtime import (
     is_deepseek_v4, is_dspark_enabled, model_architectures,
 )
 from vllm_hcu.patch.config import HcuFeatureConfig, get_hcu_config, set_hcu_config
+from vllm_hcu.runtime_compat.deepseek_v41_pcp import (
+    is_v41_pcp, require_v41_pcp_contract,
+)
 
 from ._common import PatchCompatibilityError, apply_once, load_exact_module
 from .patch_compilation_config import bind_hcu_config
@@ -345,6 +348,9 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
     is_dsv4 = architectures in (
         ["DeepseekV4ForCausalLM"], ["DeepSeekV4MTPModel"]
     )
+    is_dsv41 = is_v41_pcp(vllm_config)
+    if is_dsv41:
+        require_v41_pcp_contract(vllm_config)
     is_glm53 = is_glm53_pcp(vllm_config)
     is_glm53_mtp = _is_glm53_mtp_pcp(vllm_config)
     if is_glm53:
@@ -352,7 +358,7 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
     if is_glm53_mtp:
         _require_glm53_mtp_pcp_contract(vllm_config)
     if use_mla and not (
-        is_dsa_mla or is_glm52 or is_hy4 or is_glm53 or is_glm53_mtp or is_dsv4
+        is_dsa_mla or is_glm52 or is_hy4 or is_glm53 or is_glm53_mtp or is_dsv4 or is_dsv41
     ):
         raise ValueError(
             "HCU MLA PCP only supports a registered DSA MLA family, "
@@ -479,6 +485,8 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
             )
 
     feature_config = get_hcu_config(vllm_config)
+    if is_dsv41 and (feature_config.enable_dsa_cache_layer_split or feature_config.deepep_auto):
+        raise ValueError("V41 PCP requires full replicated caches and explicit HT")
     if feature_config.enable_lightly_cp:
         raise ValueError("HCU PCP does not support lightly-CP.")
     if feature_config.enable_multi_layers_mtp:

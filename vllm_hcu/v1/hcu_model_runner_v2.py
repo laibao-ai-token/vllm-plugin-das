@@ -28,13 +28,15 @@ from vllm_hcu.patch.config import get_hcu_config
 from vllm_hcu.v1.pcp_manager import make_hcu_pcp_manager_cls
 from vllm_hcu.patch.platform.core_fix.patch_vllm_config import is_glm53_pcp
 from vllm_hcu.deepseek_v4_runtime import is_deepseek_v4
+from vllm_hcu.runtime_compat.deepseek_v41_pcp import is_v41_pcp
 
 
 def _uses_global_pcp_batch(vllm_config) -> bool:
     """GLM5Next and DeepSeek V4 PCP bind the global batch per step."""
     parallel_config = getattr(vllm_config, "parallel_config", None)
     pcp_size = int(getattr(parallel_config, "prefill_context_parallel_size", 1))
-    return is_glm53_pcp(vllm_config) or (pcp_size > 1 and is_deepseek_v4(vllm_config))
+    return (is_glm53_pcp(vllm_config) or is_v41_pcp(vllm_config)
+            or (pcp_size > 1 and is_deepseek_v4(vllm_config)))
 from vllm_hcu.platforms import envs as henvs
 
 logger = init_logger(__name__)
@@ -323,6 +325,10 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
 
             # Install before upstream discovers backends and checks PCP support.
             install_glm53_pcp(self)
+        elif is_v41_pcp(self.vllm_config):
+            from vllm_hcu.v1.deepseek_v41_pcp import install_v41_pcp
+
+            install_v41_pcp(self)
         elif _uses_global_pcp_batch(self.vllm_config):
             from vllm_hcu.v1.glm53_pcp import install_deepseek_v4_pcp
 
@@ -491,7 +497,9 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
             input_batch.num_computed_tokens_cpu = None
             self._hsl_batch = input_batch
         phase_batch = input_batch
-        if self.pcp_manager is not None and is_deepseek_v4(self.vllm_config):
+        if self.pcp_manager is not None and (
+            is_deepseek_v4(self.vllm_config) or is_v41_pcp(self.vllm_config)
+        ):
             # Empty PCP shards must choose the same DeepEP collective as
             # ranks owning a real prefill, including one-token prompts.
             phase_batch = self.pcp_manager._global_batch
@@ -591,7 +599,15 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
             phase_scope = _deepep_auto_dummy_phase_scope(
                 not bool(kwargs.get("uniform_decode", False))
             )
-        with phase_scope:
+        profile_scope = nullcontext()
+        if is_v41_pcp(self.vllm_config):
+            from vllm_hcu.v1.deepseek_v41_pcp import initial_profile_scope
+
+            profile_scope = initial_profile_scope(
+                self, num_tokens, skip_attn=kwargs.get("skip_attn", False),
+                is_profile=kwargs.get("is_profile", False),
+            )
+        with phase_scope, profile_scope:
             return self._dummy_run_with_phase(num_tokens, *args, **kwargs)
 
     def _dummy_run_with_phase(self, num_tokens, *args, **kwargs):

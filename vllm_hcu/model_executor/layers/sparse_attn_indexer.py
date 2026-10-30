@@ -7,6 +7,9 @@
 import torch
 
 from vllm_hcu.v1.attention.ops.indexer_candidates import validate_candidate_schema
+from vllm_hcu.v1.deepseek_v41_pcp import (
+    logical_indexer_pcp_width, require_global_indexer_rows,
+)
 
 import vllm.envs as envs
 from vllm import _custom_ops as ops
@@ -930,10 +933,14 @@ class SparseAttnIndexer(CustomOp):
         self._cp_kv_cache_interleave_size: int | None = None
         self.pcp_world_size = parallel_config.prefill_context_parallel_size
         self.use_pcp = self.pcp_world_size > 1
+        logical_pcp_width = logical_indexer_pcp_width(
+            get_current_vllm_config(), k_cache, skip_k_cache_insert, compress_ratio,
+        )
+        self._v41_global_pcp = logical_pcp_width != self.pcp_world_size
         validate_candidate_schema(
             candidate_blocks, candidate_block_size, candidate_write,
             topk_indices_buffer, use_fp4_cache, self.dcp_world_size,
-            self.pcp_world_size,
+            logical_pcp_width,
         )
         self.candidate_blocks = candidate_blocks
         self.candidate_block_size = candidate_block_size
@@ -1025,6 +1032,8 @@ class SparseAttnIndexer(CustomOp):
         k: torch.Tensor | None,
         weights: torch.Tensor,
     ):
+        if getattr(self, "_v41_global_pcp", False):
+            require_global_indexer_rows(self, hidden_states, q_quant, k, weights)
         assert not self.use_fp4_cache, "HCU platform doesn't support fp4 cache yet"
         assert isinstance(q_quant, torch.Tensor), (
             "HCU sparse_attn_indexer expects a single FP8 q_quant tensor"
