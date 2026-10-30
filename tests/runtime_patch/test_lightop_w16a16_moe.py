@@ -89,6 +89,7 @@ def _target_module():
         moe_config,
         w13_weight,
         w2_weight,
+        layer=None,
     ):
         del moe_config
         if not isinstance(
@@ -96,6 +97,7 @@ def _target_module():
         ):
             raise ValueError("converter received a stale oracle enum")
         calls.append(("convert", (w13_weight, w2_weight)))
+        calls.append(("convert_layer", layer))
         return w13_weight, w2_weight
 
     def make_unquantized_moe_kernel(

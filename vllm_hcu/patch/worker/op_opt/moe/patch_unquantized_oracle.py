@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import functools
+import inspect
 import sys
 from types import ModuleType
 
@@ -70,11 +71,20 @@ def apply_to_module(module: ModuleType) -> bool:
     require_parameter_names(backend_to_cls, TARGETS[1], ("backend",))
     require_parameter_names(map_backend, TARGETS[2], ("runner_backend",))
     require_parameter_names(select_backend, TARGETS[3], ("moe_config",))
-    require_parameter_names(
+    convert_signature = require_parameter_names(
         convert,
         TARGETS[4],
-        ("unquantized_backend", "moe_config", "w13_weight", "w2_weight"),
+        ("unquantized_backend", "moe_config", "w13_weight", "w2_weight", "layer"),
     )
+    layer_parameter = convert_signature.parameters["layer"]
+    if (
+        layer_parameter.kind is not inspect.Parameter.POSITIONAL_OR_KEYWORD
+        or layer_parameter.default is not None
+    ):
+        raise PatchCompatibilityError(
+            f"required HCU patch target {TARGETS[4]} requires layer=None "
+            "as a positional-or-keyword parameter"
+        )
     require_parameter_names(
         make_kernel,
         TARGETS[5],
@@ -178,6 +188,7 @@ def apply_to_module(module: ModuleType) -> bool:
         moe_config,
         w13_weight,
         w2_weight,
+        layer=None,
     ):
         if unquantized_backend == hcu_enum.HCU_LIGHTOP_W16A16:
             from vllm_hcu.model_executor.layers.fused_moe import (
@@ -195,6 +206,7 @@ def apply_to_module(module: ModuleType) -> bool:
             moe_config,
             w13_weight,
             w2_weight,
+            layer=layer,
         )
 
     @functools.wraps(make_kernel)
