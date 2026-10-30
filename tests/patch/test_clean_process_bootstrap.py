@@ -69,8 +69,8 @@ assert _vllm_hcu_file.is_relative_to(_vllm_hcu_root), (
     f"vllm resolved outside target root: "
     f"{_vllm_hcu_file} not under {_vllm_hcu_root}"
 )
-assert _VllmHcuVersion(_vllm_hcu_target.__version__).release[:3] == (0, 28, 1)
-assert _VllmHcuVersion(_vllm_hcu_target_version).release[:3] == (0, 28, 1)
+assert _VllmHcuVersion(_vllm_hcu_target.__version__).release == (0, 32, 0)
+assert _VllmHcuVersion(_vllm_hcu_target_version).release == (0, 32, 0)
 assert "VLLM_V0251_SOURCE_ROOT" not in _vllm_hcu_os.environ
 """
 

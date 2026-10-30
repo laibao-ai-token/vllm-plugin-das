@@ -23,11 +23,11 @@ from vllm_hcu.version import __vllm_target_version__
 
 
 REPO = Path(__file__).resolve().parents[2]
-TARGET_RELEASE = Version(__vllm_target_version__).release[:3]
+TARGET_RELEASE = Version(__vllm_target_version__).release
 TARGET_VLLM_ROOT = resolve_target_vllm_root()
-if TARGET_RELEASE != (0, 28, 1):
+if TARGET_RELEASE != (0, 32, 0):
     raise RuntimeError(
-        "worker dispatcher tests require the v0.28.1 target release, got "
+        "worker dispatcher tests require the v0.32.0 target release, got "
         f"{__vllm_target_version__}"
     )
 
@@ -47,10 +47,10 @@ assert _vllm_hcu_file.is_relative_to(_vllm_hcu_root), (
 _vllm_hcu_expected_release = tuple(
     int(part) for part in _vllm_hcu_os.environ["VLLM_TARGET_RELEASE"].split(".")
 )
-assert _VllmHcuVersion(_vllm_hcu_target.__version__).release[:3] == (
+assert _VllmHcuVersion(_vllm_hcu_target.__version__).release == (
     _vllm_hcu_expected_release
 ), (_vllm_hcu_target.__version__, _vllm_hcu_expected_release)
-assert _VllmHcuVersion(_vllm_hcu_target_version).release[:3] == (
+assert _VllmHcuVersion(_vllm_hcu_target_version).release == (
     _vllm_hcu_expected_release
 ), (_vllm_hcu_target_version, _vllm_hcu_expected_release)
 assert "VLLM_V0251_SOURCE_ROOT" not in _vllm_hcu_os.environ
@@ -84,7 +84,7 @@ def test_fresh_process_uses_current_target_release_source():
     assert result.returncode == 0, result.stdout + result.stderr
     payload = json.loads(result.stdout.strip().splitlines()[-1])
     assert Path(payload["file"]).resolve().is_relative_to(TARGET_VLLM_ROOT)
-    assert Version(payload["version"]).release[:3] == TARGET_RELEASE
+    assert Version(payload["version"]).release == TARGET_RELEASE
     assert Path(payload["source_root"]).resolve() == TARGET_VLLM_ROOT
 
 

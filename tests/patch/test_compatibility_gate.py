@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import ast
 from pathlib import Path
 
 import pytest
@@ -49,17 +50,18 @@ def _install_version(
     )
 
 
-def test_frozen_opendas_vllm_wheel_is_accepted(
+def test_fixed_community_scm_release_is_accepted(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    value = "0.28.1rc1.dev491+g462fdb097.das.462fdb0.dtk2604"
+    # Observed via the fixed core SCM recipe without writing its _version.py.
+    value = "0.32.0rc1.dev16+g5df63a720"
     _install_version(monkeypatch, tmp_path, value)
 
     result = compatibility.ensure_vllm_compatible()
 
     assert result.compatible
-    assert result.expected == value
+    assert result.expected == "0.32.0"
     assert result.actual_version == value
     assert result.vllm_location == str((tmp_path / "site-packages").resolve())
 
@@ -67,15 +69,15 @@ def test_frozen_opendas_vllm_wheel_is_accepted(
 @pytest.mark.parametrize(
     "value",
     (
-        "0.28.1",
-        "0.28.1+das.vendor.dtk2604",
-        "0.28.1rc1.dev491+g58ad1f3b",
-        "0.28.1rc1.dev999+gdeadbee.das.vendor.dtk2604",
-        "0.28.1rc2",
-        "0.28.1.post1",
+        "0.32.0",
+        "0.32.0+local.test",
+        "0.32.0rc0",
+        "0.32.0rc1.dev16+g5df63a720",
+        "0.32.0.dev999+local.test",
+        "0.32.0.post1",
     ),
 )
-def test_v0281_release_line_accepts_rolling_vendor_builds(
+def test_v0320_release_line_accepts_rolling_builds(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     value: str,
@@ -87,19 +89,21 @@ def test_v0281_release_line_accepts_rolling_vendor_builds(
     assert result.compatible
     assert result.actual_version == value
     assert result.reason == (
-        "installed vLLM build matches supported release line 0.28.1"
+        "installed vLLM build matches supported release line 0.32.0"
     )
 
 
 @pytest.mark.parametrize(
     "value",
     (
-        "0.20.2",
-        "0.22.0",
-        "0.25.1+das.local",
-        "0.28.0",
-        "0.28.9",
-        "1!0.28.1rc1.dev491+g462fdb097.das.462fdb0.dtk2604",
+        "0.28.1",
+        "0.29.1rc0.dev283",
+        "0.31.1",
+        "0.32.1",
+        "0.33.0",
+        "0.32.0.0",
+        "0.32",
+        "1!0.32.0",
         "not a version",
     ),
 )
@@ -114,13 +118,10 @@ def test_unsupported_or_invalid_vllm_metadata_has_actionable_error(
         compatibility.ensure_vllm_compatible()
 
     message = str(raised.value)
-    assert (
-        "expected=0.28.1rc1.dev491+g462fdb097.das.462fdb0.dtk2604"
-        in message
-    )
+    assert "expected=0.32.0" in message
     assert f"actual={value!r}" in message
-    assert "upstream_sha=58ad1f3b8973b23943107b51230d594050b42ec3" in message
-    assert "opendas_sha=462fdb097c66b487ef4826e8009431c10fe88fb8" in message
+    assert "upstream_sha=5df63a7203cdb9328d824a27b682e77c7b9928be" in message
+    assert "opendas_sha=;" in message
     assert "vllm_hcu=" in message
     assert "vllm_location=" in message
     assert "vllm_hcu_location=" in message
@@ -147,11 +148,11 @@ def test_runtime_hcu_version_prefers_metadata_with_source_fallback(
     monkeypatch.setattr(
         hcu_version.importlib_metadata,
         "version",
-        lambda name: "0.28.1rc1.dev491+das.abcdef0.dtk2604",
+        lambda name: "0.32.0.dev0+local.test",
     )
     assert (
         hcu_version.get_hcu_version()
-        == "0.28.1rc1.dev491+das.abcdef0.dtk2604"
+        == "0.32.0.dev0+local.test"
     )
 
     def missing(name: str):
@@ -206,3 +207,33 @@ def test_all_plugin_entries_gate_and_platform_probe_latches_compatibility(
 
     assert IMPORT_COORDINATOR.registrations() == ()
     assert PATCH_REGISTRY.report()["patches"] == {}
+
+
+def test_source_and_build_metadata_share_fixed_community_contract():
+    from packaging.version import Version
+
+    root = Path(__file__).resolve().parents[2]
+    tree = ast.parse((root / "setup.py").read_text(encoding="utf-8"))
+    base = next(
+        ast.literal_eval(node.value)
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and any(isinstance(t, ast.Name) and t.id == "BASE_VERSION" for t in node.targets)
+    )
+    setup_call = next(
+        node for node in tree.body
+        if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call)
+        and isinstance(node.value.func, ast.Name) and node.value.func.id == "setup"
+    ).value
+    python_requires = next(
+        ast.literal_eval(kw.value) for kw in setup_call.keywords
+        if kw.arg == "python_requires"
+    )
+    assert base == hcu_version.__version__ == "0.32.0.dev0"
+    assert Version(base).release == hcu_version.__version_tuple__ == (0, 32, 0)
+    assert hcu_version.__vllm_target_version__ == "0.32.0"
+    assert hcu_version.__vllm_upstream_sha__ == (
+        "5df63a7203cdb9328d824a27b682e77c7b9928be"
+    )
+    assert hcu_version.__vllm_opendas_sha__ == ""
+    assert python_requires == ">=3.11,<3.15"

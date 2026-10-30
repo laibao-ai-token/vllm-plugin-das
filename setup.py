@@ -23,7 +23,7 @@ if "MAX_JOBS" not in os.environ:
 # 基础路径
 # =========================================================
 ROOT = Path(__file__).parent.resolve()
-BASE_VERSION = "0.28.1rc1.dev491"
+BASE_VERSION = "0.32.0.dev0"
 
 ADD_GIT_VERSION = os.environ.get("ADD_GIT_VERSION", "1") == "1"
 
@@ -190,7 +190,7 @@ setup(
     version=get_version(),
     description="vLLM HCU backend plugin",
     license="Apache-2.0",
-    python_requires=">=3.10",
+    python_requires=">=3.11,<3.15",
     packages=find_namespace_packages(include=["vllm_hcu", "vllm_hcu.*"]),
     package_data={
         "vllm_hcu": [
