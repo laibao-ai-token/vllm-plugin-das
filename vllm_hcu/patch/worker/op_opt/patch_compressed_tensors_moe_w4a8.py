@@ -24,51 +24,88 @@ _MARKER = "_vllm_hcu_ct_w4a8_deepgemm"
 
 
 def _validate_topology(config, moe, is_draft_model):
+    """Validate CT W4A8 invariants, not a fixed list of parallel deployments.
+
+    The W4A8 expert path holds no data-parallel state: weights, packing and
+    DeepEP/DeepGEMM experts are EP-scoped. DP width is therefore checked
+    against the actual EP group and MoE capacity instead of being hard-coded.
+    TP/PP/DCP remain real layout constraints of the packed HIPC kernel.
+    """
+    from vllm_hcu.dspark_runtime import native_decode_dspark
+    native_decode = native_decode_dspark(config)
     parallel = config.parallel_config
     scope = "draft" if is_draft_model else "prefill"
-    if not is_draft_model and (
-        parallel.prefill_context_parallel_size, parallel.data_parallel_size
-    ) == (1, 8):
+    if not is_draft_model and parallel.prefill_context_parallel_size == 1:
         scope = "decode"
     reasons = []
-    if parallel.tensor_parallel_size != 1: reasons.append(f"tp={parallel.tensor_parallel_size}")
-    if parallel.pipeline_parallel_size != 1: reasons.append(f"pp={parallel.pipeline_parallel_size}")
-    if parallel.decode_context_parallel_size != 1: reasons.append(f"dcp={parallel.decode_context_parallel_size}")
+    if parallel.tensor_parallel_size != 1:
+        reasons.append(f"tp={parallel.tensor_parallel_size}")
+    if parallel.pipeline_parallel_size != 1:
+        reasons.append(f"pp={parallel.pipeline_parallel_size}")
+    if parallel.decode_context_parallel_size != 1:
+        reasons.append(f"dcp={parallel.decode_context_parallel_size}")
     backend = moe.moe_parallel_config.all2all_backend
+    actual_parallel = moe.moe_parallel_config
     if scope == "decode":
-        if not moe.moe_parallel_config.use_ep or backend != "deepep_low_latency":
+        dp = parallel.data_parallel_size
+        if type(dp) is not int or dp < 1:
+            reasons.append(f"dp={dp}")
+        if not actual_parallel.use_ep or backend != "deepep_low_latency":
             reasons.append("decode_requires_fixed_ll_ep")
         budget = config.scheduler_config.max_num_batched_tokens
         declared = getattr(moe, "max_num_tokens", None)
         if (type(budget) is not int or budget <= 0
                 or type(declared) is not int or declared != budget):
             reasons.append("moe_capacity_must_match_scheduler")
-        actual_parallel = moe.moe_parallel_config
-        for name, expected in (("tp_size", 1), ("pcp_size", 1), ("dp_size", 8), ("ep_size", 8)):
+        for name, expected in (("tp_size", 1), ("pcp_size", 1),
+                               ("dp_size", dp), ("ep_size", dp)):
             if getattr(actual_parallel, name, None) != expected:
                 reasons.append(f"moe_{name}_mismatch")
-        # The common producer is a separate, unlanded slice. Its API/field
-        # existing in a candidate is not deployment evidence or an enable flag.
-        reasons.append("decode_common_contract=unverified")
+        from vllm_hcu.dspark_runtime import validate_graph_capacity
+        validate_graph_capacity(config, moe)
+        if native_decode:
+            from vllm_hcu.dspark_runtime import token_capacity
+            token_capacity(config)
     else:
         expected_pcp = 1 if is_draft_model else 8
         if parallel.prefill_context_parallel_size != expected_pcp:
             reasons.append(f"pcp={parallel.prefill_context_parallel_size}")
         if parallel.data_parallel_size != 1:
-            reasons.append(f"dp={parallel.data_parallel_size}")
-            if is_draft_model:
-                reasons.append("draft_group_capacity_contract=unverified")
+            if is_draft_model and native_decode and parallel.data_parallel_size > 1:
+                from vllm_hcu.dspark_runtime import (
+                    get_dspark_all2all_manager,
+                    get_dspark_token_capacity,
+                    validate_graph_capacity,
+                )
+                manager = get_dspark_all2all_manager(moe)
+                capacity = get_dspark_token_capacity()
+                dp = parallel.data_parallel_size
+                if (manager is None or capacity is None
+                        or getattr(manager, "world_size", None) != dp
+                        or getattr(manager, "dp_world_size", None) != dp
+                        or getattr(actual_parallel, "ep_size", None) != dp
+                        or getattr(actual_parallel, "dp_size", None) != dp
+                        or getattr(moe, "max_num_tokens", None) != capacity.capacity_per_rank):
+                    reasons.append("draft_group_capacity_contract=unverified: draft manager/scope mismatch")
+                validate_graph_capacity(config, moe)
+            else:
+                reasons.append(f"dp={parallel.data_parallel_size}")
+                if is_draft_model:
+                    reasons.append("draft_group_capacity_contract=unverified: draft manager/scope missing")
         if backend not in ("deepep_high_throughput", "allgather_reducescatter"):
             reasons.append("prefill_or_draft_requires_contiguous_backend")
-    if parallel.enable_eplb: reasons.append("eplb=True")
-    if not config.model_config.enforce_eager:
+    if parallel.enable_eplb:
+        reasons.append("eplb=True")
+    # PCP's virtual batch cannot be captured; PCP1 decode may use graphs.
+    if scope == "prefill" and not config.model_config.enforce_eager:
         reasons.append("enforce_eager=False; graph_contract=unverified")
     if is_draft_model:
         spec = getattr(config, "speculative_config", None)
         draft_model = getattr(spec, "draft_model_config", None)
-        if draft_model is not None and not draft_model.enforce_eager:
+        if draft_model is not None and not draft_model.enforce_eager and not native_decode:
             reasons.append("draft_graph_contract=unverified")
-    if config.lora_config is not None: reasons.append("lora!=None")
+    if config.lora_config is not None:
+        reasons.append("lora!=None")
     if reasons:
         raise ValueError(
             "HCU CT W4A8 topology contract rejected; "

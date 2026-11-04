@@ -41,8 +41,23 @@ def apply_to_module(module: ModuleType) -> bool:
                             num_tokens_across_dp, cudagraph_runtime_mode)
         if getattr(self, "_speculator_name", None) != "DSpark":
             raise ValueError("DSpark draft scope is attached to a non-DSpark speculator")
+        static_ep = getattr(scope, "static_ep", False)
         if cudagraph_runtime_mode != mode_none:
-            raise ValueError("DSpark draft context scope currently supports eager execution only")
+            if not static_ep or cudagraph_runtime_mode != target.CUDAGraphMode.FULL:
+                raise ValueError("DSpark draft context scope supports eager or native FULL capture only")
+        if static_ep:
+            if num_tokens > scope.capacity.capacity_per_rank:
+                raise ValueError("DSpark draft context exceeds checked token capacity")
+            # Capture/profile lack live scheduler counts but build identical
+            # padded tensors on all ranks. Real steps receive MAX-synced slots.
+            if num_tokens_across_dp is None:
+                import torch
+                num_tokens_across_dp = torch.full(
+                    (scope.config.parallel_config.data_parallel_size,),
+                    num_tokens, dtype=torch.int32,
+                )
+            elif any(int(n) != num_tokens for n in num_tokens_across_dp):
+                raise ValueError("DSpark AG-RS requires uniform padded token slots")
         with scope.activate():
             previous = self.vllm_config
             self.vllm_config = scope.config

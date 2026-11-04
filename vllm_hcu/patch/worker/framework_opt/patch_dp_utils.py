@@ -16,6 +16,20 @@ _MARKER = "_vllm_hcu_dp_low_latency_applied"
 _WRAPPER = "_vllm_hcu_dp_low_latency_wrapper"
 
 
+def _max_low_latency_token_slot(num_tokens_unpadded, num_tokens_padded, parallel_config):
+    import torch
+    import torch.distributed as dist
+    from vllm.distributed.parallel_state import get_dp_group
+    group = get_dp_group()
+    cpu_sync = getattr(parallel_config, "disable_nccl_for_dp_synchronization", False)
+    device = "cpu" if cpu_sync else group.device
+    process_group = group.cpu_group if cpu_sync else group.device_group
+    local = num_tokens_padded if num_tokens_padded is not None else num_tokens_unpadded
+    slot = torch.tensor([local], dtype=torch.int32, device=device)
+    dist.all_reduce(slot, op=dist.ReduceOp.MAX, group=process_group)
+    return int(slot.item())
+
+
 def apply_to_module(module: ModuleType) -> bool:
     dp = load_exact_module(TARGET_MODULE, module)
     wrapped = ((dp, "coordinate_batch_across_dp", TARGETS[0], _WRAPPER),)
@@ -58,6 +72,17 @@ def apply_to_module(module: ModuleType) -> bool:
                 )
             )
         ):
+            if parallel_config.data_parallel_size > 1:
+                from vllm.config import get_current_vllm_config_or_none
+                from vllm_hcu.dspark_runtime import native_decode_dspark
+                config = get_current_vllm_config_or_none()
+                if config is not None and native_decode_dspark(config):
+                    import torch
+                    slot = _max_low_latency_token_slot(
+                        num_tokens_unpadded, num_tokens_padded, parallel_config)
+                    return False, torch.full(
+                        (parallel_config.data_parallel_size,), slot, dtype=torch.int32,
+                    ), cudagraph_mode
             return False, None, cudagraph_mode
         return original(
             num_tokens_unpadded,

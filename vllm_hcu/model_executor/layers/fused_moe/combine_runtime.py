@@ -3,7 +3,22 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """Optional HCU EP combine ownership for naive DP/EP finalize."""
 
+from contextvars import ContextVar
+
 _combine_hook = None
+_ACTIVE_EP_GROUP = ContextVar("hcu_active_ep_group", default=None)
+
+
+def set_active_ep_group(group):
+    return _ACTIVE_EP_GROUP.set(group)
+
+
+def reset_active_ep_group(token):
+    _ACTIVE_EP_GROUP.reset(token)
+
+
+def get_active_ep_group():
+    return _ACTIVE_EP_GROUP.get()
 
 
 def set_finalize_combine_hook(hook):
@@ -40,7 +55,8 @@ def finalize(
             if combined.shape != output.shape or combined.dtype != output.dtype:
                 raise ValueError("The HCU combine hook returned an incompatible tensor")
             return combined
+    group = get_active_ep_group() or get_ep_group()
     output.copy_(
-        get_ep_group().combine(out, is_sequence_parallel=self.is_sequence_parallel)
+        group.combine(out, is_sequence_parallel=self.is_sequence_parallel)
     )
     return None

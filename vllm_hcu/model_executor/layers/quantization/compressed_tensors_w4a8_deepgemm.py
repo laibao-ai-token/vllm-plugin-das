@@ -275,6 +275,9 @@ class HCUCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
                 "HCU CT W4A8 did not construct a prepare/finalize for "
                 f"all2all_backend={self.moe.moe_parallel_config.all2all_backend!r}"
             )
+        if manager is not None and getattr(manager, "_hcu_dspark_static_ownership", False):
+            from vllm_hcu.dspark_runtime import bind_draft_prepare_finalize
+            prepare = bind_draft_prepare_finalize(prepare, manager)
         if fixed_ll:
             from vllm.model_executor.layers.fused_moe.prepare_finalize.deepep_ll import (
                 DeepEPLLPrepareAndFinalize,

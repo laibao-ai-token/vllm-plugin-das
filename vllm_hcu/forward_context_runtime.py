@@ -282,8 +282,11 @@ def set_forward_context(
         parallel_config.all2all_backend == "deepep_low_latency"
         and not getattr(parallel_config, "_vllm_hcu_deepep_auto", False)
     )
+    engram_shared_dp = bool(
+        getattr(getattr(vllm_config, "engram_config", None), "embedding_across_dp", False)
+    )
     if (
-        not low_latency
+        (not low_latency or engram_shared_dp)
         and (
             parallel_config.data_parallel_size > 1
             or parallel_config.use_sequence_parallel_moe

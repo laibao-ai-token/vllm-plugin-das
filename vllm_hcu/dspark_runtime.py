@@ -56,6 +56,66 @@ def token_capacity(vllm_config) -> DSparkTokenCapacity:
     return result
 
 
+def native_decode_dspark(config):
+    """Original acc_d scope; no opt-in or claim of prior GPU validation."""
+    spec = getattr(config, "speculative_config", None)
+    parallel = getattr(spec, "target_parallel_config", None)
+    if parallel is None:
+        parallel = config.parallel_config
+    hf = getattr(config.model_config, "hf_config", None)
+    return (
+        getattr(spec, "method", None) == "dspark"
+        and getattr(hf, "model_type", None) in ("deepseek_v4", "deepseek_v41")
+        and (parallel.tensor_parallel_size, parallel.prefill_context_parallel_size,
+             parallel.pipeline_parallel_size, parallel.data_parallel_size) == (1, 1, 1, 8)
+        and parallel.enable_expert_parallel
+        and parallel.all2all_backend == "deepep_low_latency"
+    )
+
+
+def validate_graph_capacity(config, moe=None):
+    """Validate resolved token buckets; do not replace fixed LL capacity by M."""
+    if config.model_config.enforce_eager:
+        return
+    compilation = getattr(config, "compilation_config", None)
+    sizes = getattr(compilation, "cudagraph_capture_sizes", None)
+    mode = getattr(getattr(compilation, "cudagraph_mode", None), "name", None)
+    if (mode not in ("FULL", "FULL_DECODE_ONLY", "FULL_AND_PIECEWISE", "PIECEWISE")
+            or not sizes or any(type(n) is not int or n <= 0 for n in sizes)):
+        raise ValueError("CT decode graph capture requires known mode and positive token buckets")
+    budget = config.scheduler_config.max_num_batched_tokens
+    if max(sizes) > budget:
+        raise ValueError("CT decode graph capture exceeds scheduler capacity")
+    if moe is not None:
+        declared = getattr(moe, "max_capture_size", None)
+        if type(declared) is not int or max(sizes) > declared or declared > budget:
+            raise ValueError("CT decode graph capture does not match MoE producer capacity")
+
+
+def bind_draft_prepare_finalize(prepare, manager):
+    """Bind all current naive P/F EP dependencies per instance, before capture.
+
+    The 0.29 binding covered prepare/finalize. v0.32 additionally resolves EP
+    in _allocate_combine_input; leave global EP and target LL ownership intact.
+    """
+    from types import FunctionType, MethodType
+    previous = getattr(prepare, "_hcu_dspark_bound_manager", None)
+    if previous is not None:
+        if previous is not manager:
+            raise RuntimeError("DSpark prepare/finalize manager changed")
+        return prepare
+    for name in ("prepare", "finalize", "_allocate_combine_input"):
+        original = getattr(prepare, name).__func__
+        function = FunctionType(original.__code__,
+            dict(original.__globals__, get_ep_group=lambda: manager),
+            original.__name__, original.__defaults__, original.__closure__)
+        function.__kwdefaults__ = original.__kwdefaults__
+        functools.update_wrapper(function, original)
+        setattr(prepare, name, MethodType(function, prepare))
+    prepare._hcu_dspark_bound_manager = manager
+    return prepare
+
+
 def draft_config(vllm_config):
     spec = vllm_config.speculative_config
     target = spec.target_parallel_config
@@ -72,7 +132,10 @@ def draft_config(vllm_config):
     if parallel.data_parallel_size != target.data_parallel_size:
         raise ValueError("DSpark runtime DP size must match target DP size")
     if not vllm_config.model_config.enforce_eager or not spec.draft_model_config.enforce_eager:
-        raise ValueError("DSpark AG-RS scope currently requires eager target and draft execution")
+        if not native_decode_dspark(vllm_config):
+            raise ValueError("DSpark AG-RS scope currently requires eager target and draft execution outside native DP8")
+        validate_graph_capacity(vllm_config)
+        token_capacity(vllm_config)
     result = copy.copy(vllm_config)
     result.parallel_config = copy.deepcopy(parallel)
     result.parallel_config.all2all_backend = _BACKEND
@@ -171,6 +234,7 @@ class DSparkDraftScope:
         self.current_config = current_config
         self.capacity = capacity
         self.owner_thread = get_ident()
+        self.static_ep = False
 
     @contextmanager
     def activate(self):
@@ -183,11 +247,16 @@ class DSparkDraftScope:
             if previous is not self.target_ep and previous is not self.draft_ep:
                 raise RuntimeError("DSpark EP owner changed outside the draft scope")
             token = _ACTIVE_SCOPE.set(self)
-            self.parallel_state._EP = self.draft_ep
+            from vllm_hcu.model_executor.layers.fused_moe.combine_runtime import set_active_ep_group
+            combine_token = set_active_ep_group(self.draft_ep)
+            if not self.static_ep:
+                self.parallel_state._EP = self.draft_ep
             try:
                 with self.current_config(self.config):
                     yield
             finally:
+                from vllm_hcu.model_executor.layers.fused_moe.combine_runtime import reset_active_ep_group
+                reset_active_ep_group(combine_token)
                 self.parallel_state._EP = previous
                 _ACTIVE_SCOPE.reset(token)
 
@@ -213,7 +282,8 @@ def get_dspark_all2all_manager(moe):
 
 def load_with_draft_scope(original, target_model, vllm_config):
     feature = get_hcu_config(vllm_config)
-    if feature.dspark_draft_all2all_backend is None:
+    automatic = native_decode_dspark(vllm_config)
+    if feature.dspark_draft_all2all_backend is None and not automatic:
         return original(target_model, vllm_config)
     spec = vllm_config.speculative_config
     if getattr(spec, "method", None) != "dspark":
@@ -239,6 +309,14 @@ def load_with_draft_scope(original, target_model, vllm_config):
             raise ValueError("DSpark AG-RS manager does not match the draft DP/EP group")
     scope = DSparkDraftScope(vllm_config, config, target_ep, manager, parallel_state,
                             set_current_vllm_config, capacity)
+    scope.static_ep = automatic
+    if automatic:
+        manager._hcu_dspark_static_ownership = True
+        def padded_sizes(num_local_tokens, comm_group):
+            if not 0 <= num_local_tokens <= capacity.capacity_per_rank:
+                raise ValueError("DSpark AG-RS local token capacity exceeded")
+            return [num_local_tokens] * comm_group.world_size
+        manager._get_sizes = padded_sizes
     with scope.activate():
         model = original(target_model, config)
     forward = model.forward
