@@ -35,6 +35,7 @@ from . import (
     patch_glm5next_channel_fp8,
     patch_mhc_backend,
     patch_mhc_fused_rmsnorm,
+    patch_mhc_pre_backend,
     patch_minimax_m3_aiter_cache,
     patch_minimax_m3_sparse_decode,
     patch_qwen3_5_mamba_state_dtype,

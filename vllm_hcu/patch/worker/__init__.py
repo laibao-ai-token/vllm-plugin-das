@@ -268,6 +268,7 @@ _OP_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("op_opt", "patch_attention_backend_utils")),
     _CallbackSpec(_adapter("op_opt", "patch_triton_unified_attention")),
     _CallbackSpec(_adapter("op_opt", "patch_mla_attention")),
+    _CallbackSpec(_adapter("op_opt", "patch_deepseek_v41_attn_inverse_rope")),
     _CallbackSpec(_adapter("op_opt", "patch_mla_layer"), feature="lightly_cp"),
     _CallbackSpec(_adapter("op_opt", "patch_mla_indexer")),
     _CallbackSpec(_adapter("op_opt", "patch_flashmla_sparse")),
