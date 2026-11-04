@@ -1694,10 +1694,14 @@ def rocm_aiter_sparse_attn_indexer_native(
     )
     # careful! this will be None in dummy run
     attn_metadata = get_forward_context().attn_metadata
+    # The DSA indexer cache is FP8-packed (uint8) on this model. Decide by the
+    # real cache dtype rather than the gfx938 arch check: gfx936 runs the same
+    # FP8 cache here, and a genuinely BF16 cache keeps the legacy path.
+    use_fp8_indexer_cache = kv_cache.dtype != torch.bfloat16
     fp8_dtype = (
         current_platform.fp8_dtype()
-        if not current_platform.is_rocm() or on_gfx938()
-        else kv_cache.dtype if k is None else k.dtype
+        if use_fp8_indexer_cache
+        else (kv_cache.dtype if k is None else k.dtype)
     )
     from vllm import _custom_ops as ops
     from vllm.utils.torch_utils import _resolve_layer_name
@@ -1832,7 +1836,7 @@ def rocm_aiter_sparse_attn_indexer_native(
             k_fp8 = k_fp8_full[:chunk_max_local_seq_lens]
             k_scale = k_scale_full[:chunk_max_local_seq_lens]
             if not skip_kv_gather and local_total_seq_lens > 0:
-                if not current_platform.is_rocm() or on_gfx938():
+                if use_fp8_indexer_cache:
                     ops.cp_gather_indexer_k_quant_cache(
                         hipc_kv_cache,
                         k_fp8,

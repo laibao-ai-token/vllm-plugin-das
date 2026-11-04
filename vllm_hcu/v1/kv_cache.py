@@ -86,9 +86,11 @@ def _has_packed_kv_descriptors(
         bound = inspect.signature(official_init_kv_cache).bind(*args, **kwargs)
     except (TypeError, ValueError):
         return False
+    from vllm_hcu.v1.dsa_cache_layer_split import packed_kv_backing_id
+
     config = bound.arguments.get("kv_cache_config")
     for descriptor in getattr(config, "kv_cache_tensors", ()) or ():
-        if int(getattr(descriptor, "block_stride", 0) or 0) > 0:
+        if packed_kv_backing_id(descriptor) is not None:
             return True
     return False
 

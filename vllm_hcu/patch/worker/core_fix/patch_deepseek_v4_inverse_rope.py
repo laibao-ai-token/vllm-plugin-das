@@ -96,7 +96,9 @@ def apply_to_module(module: ModuleType) -> bool:
             "n_local_groups",
             "o_lora_rank",
             "wo_a",
+            "inverse_rope",
         ),
+        defaults={"inverse_rope": True},
     )
 
     @functools.wraps(original)
@@ -108,8 +110,9 @@ def apply_to_module(module: ModuleType) -> bool:
         n_local_groups,
         o_lora_rank,
         wo_a,
+        inverse_rope=True,
     ):
-        if not _eligible(
+        if not inverse_rope or not _eligible(
             rotary_emb, o, positions, rope_head_dim, n_local_groups
         ):
             return original(
@@ -120,6 +123,7 @@ def apply_to_module(module: ModuleType) -> bool:
                 n_local_groups,
                 o_lora_rank,
                 wo_a,
+                inverse_rope=inverse_rope,
             )
 
         from vllm.v1.attention.ops import rocm_aiter_mla_sparse as ops

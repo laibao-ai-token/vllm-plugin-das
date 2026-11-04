@@ -35,7 +35,11 @@ def require_v41_pcp_contract(config):
         raise ValueError("V41 PCP requires the explicit DeepEP HT backend")
     if config_field(parallel, "enable_eplb", False):
         raise ValueError("V41 PCP does not support EPLB")
-    if config_field(model, "is_multimodal_model", False) or config_field(config, "lora_config") is not None:
+    # v0.32 retains a multimodal-capable architecture under --language-model-only.
+    # Use the native effective-input predicate (including embedding inputs),
+    # retaining the old capability check if that native predicate is absent.
+    if config_field(model, "supports_multimodal_inputs",
+                    config_field(model, "is_multimodal_model", False)) or config_field(config, "lora_config") is not None:
         raise ValueError("V41 PCP does not support multimodal inputs or LoRA")
     if config_field(config, "kv_transfer_config") is not None or config_field(cache, "kv_offloading_size") is not None:
         raise ValueError("V41 PCP requires standalone caches without KV offload")

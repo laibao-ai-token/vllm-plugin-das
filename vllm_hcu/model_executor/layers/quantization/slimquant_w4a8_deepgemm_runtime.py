@@ -359,6 +359,11 @@ class DeepEPDeepGemmW4A8ContiguousExperts(TritonExperts):
                 expert_map=expert_map,
                 expert_tokens_meta=expert_tokens_meta,
                 aq_out=input_workspace,
+                # W4A8 is per-token, not block-128 quantized. The upstream
+                # scatter derives scale columns from K // block_size, so the
+                # default ROCm block_k=128 produces a scale layout the grouped
+                # HIPC GEMM rejects ("W4A8 WASP kernel launch failed").
+                block_size=K,
             )
         )
         m_indices = m_indices.to(dtype=torch.int32).contiguous()

@@ -451,8 +451,13 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
             raise ValueError("HY V4 PP2 PCP+MTP requires exactly two draft tokens.")
     if _require_hcu_pcp_attribute(vllm_config, "lora_config", "VllmConfig") is not None:
         raise ValueError("HCU PCP does not support LoRA.")
+    # V41 --language-model-only retains the architecture capability flag.
+    # Keep the effective input restriction, including precomputed MM embeds.
+    multimodal_predicate = (
+        "supports_multimodal_inputs" if is_dsv41 else "is_multimodal_model"
+    )
     if _require_hcu_pcp_attribute(
-        model_config, "is_multimodal_model", "ModelConfig"
+        model_config, multimodal_predicate, "ModelConfig"
     ) and not is_glm53:
         raise ValueError("HCU PCP does not support multimodal models.")
     if _require_hcu_pcp_attribute(

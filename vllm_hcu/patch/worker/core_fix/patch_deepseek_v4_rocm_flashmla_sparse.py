@@ -172,7 +172,7 @@ def _apply_decode_to_module(module: ModuleType) -> bool:
     require_exact_signature(
         original_decode,
         f"{TARGET_MODULE}.DeepseekV4ROCMAiterMLAAttention._forward_decode",
-        positional=("self", "q", "kv_cache", "swa_metadata", "attn_metadata", "swa_only", "output")
+        positional=("self", "q", "positions", "kv_cache", "swa_metadata", "attn_metadata", "swa_only", "output")
         + (("adaptive_splits",) if decode_has_adaptive_splits else ()),
     )
     require_exact_signature(
@@ -275,7 +275,7 @@ def _apply_decode_to_module(module: ModuleType) -> bool:
 
     @functools.wraps(original_decode)
     def forward_decode(
-        self, q, kv_cache, swa_metadata, attn_metadata, swa_only, output,
+        self, q, positions, kv_cache, swa_metadata, attn_metadata, swa_only, output,
         adaptive_splits=False,
     ):
         decode_kwargs = (
@@ -289,7 +289,7 @@ def _apply_decode_to_module(module: ModuleType) -> bool:
             or (q.ndim == 3 and not _flashmla_decode_supports_heads(q.shape[1]))
         ):
             return original_decode(
-                self, q, kv_cache, swa_metadata, attn_metadata, swa_only, output, **decode_kwargs
+                self, q, positions, kv_cache, swa_metadata, attn_metadata, swa_only, output, **decode_kwargs
             )
         _require_flashmla_ready()
         from vllm.models.deepseek_v4.common.ops import (
@@ -372,6 +372,9 @@ def _apply_decode_to_module(module: ModuleType) -> bool:
         if out.shape != output.shape:
             raise RuntimeError("FlashMLA returned an unexpected output shape")
         output.copy_(out.to(output.dtype))
+        # FlashMLA does not inverse-rotate output. The native caller uses this
+        # row count to apply its existing standalone inverse-RoPE to all rows.
+        return 0
 
     for fn in (
         forward_decode,

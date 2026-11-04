@@ -89,10 +89,16 @@ def apply_to_module(module: ModuleType) -> bool:
             "output",
             "extra_cache_nan_free",
             "adaptive_splits",
+            "inv_rope_positions",
+            "inv_rope_cos_sin_cache",
+            "output_mxfp8",
         ),
         defaults={
             "extra_cache_nan_free": False,
             "adaptive_splits": False,
+            "inv_rope_positions": None,
+            "inv_rope_cos_sin_cache": None,
+            "output_mxfp8": None,
         },
     )
 
@@ -152,7 +158,21 @@ def apply_to_module(module: ModuleType) -> bool:
         output,
         extra_cache_nan_free=False,
         adaptive_splits=False,
+        inv_rope_positions=None,
+        inv_rope_cos_sin_cache=None,
+        output_mxfp8=None,
     ):
+        native_options = {
+            "inv_rope_positions": inv_rope_positions,
+            "inv_rope_cos_sin_cache": inv_rope_cos_sin_cache,
+            "output_mxfp8": output_mxfp8,
+        }
+        if swa_k_cache.dtype == torch.bfloat16:
+            if any(value is not None for value in native_options.values()):
+                raise NotImplementedError(
+                    "HCU BF16 sparse decode does not support fused RoPE/MXFP8 output"
+                )
+            native_options = {}
         target = (
             bf16_sparse_attn_decode
             if swa_k_cache.dtype == torch.bfloat16
@@ -179,6 +199,7 @@ def apply_to_module(module: ModuleType) -> bool:
             output=output,
             extra_cache_nan_free=extra_cache_nan_free,
             adaptive_splits=adaptive_splits,
+            **native_options,
         )
 
     setattr(hcu_rocm_sparse_attn_decode, _DECODE_WRAPPER_MARKER, True)
