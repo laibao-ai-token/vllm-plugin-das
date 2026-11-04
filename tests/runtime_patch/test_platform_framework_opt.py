@@ -575,6 +575,49 @@ def test_output_processor_logs_first_decoder_token_once(monkeypatch):
     assert trace_calls[0][0] == ("d_first_token",)
 
 
+def _fake_weight_version_output_processor_module(calls):
+    """The v0.32 target contract: process_outputs takes weight_version."""
+
+    class OutputProcessor:
+        def process_outputs(
+            self,
+            engine_core_outputs,
+            engine_core_timestamp=None,
+            iteration_stats=None,
+            weight_version=None,
+        ):
+            calls.append(("official", weight_version))
+            for output in engine_core_outputs:
+                self.request_states[output.request_id].is_prefilling = False
+            return "result"
+
+    return _module(patch_output_processor.TARGET_MODULE, OutputProcessor=OutputProcessor)
+
+
+@pytest.mark.parametrize(
+    "factory,expected",
+    [
+        (_fake_weight_version_output_processor_module, [("official", "v2")]),
+        (_fake_output_processor_module, ["official"]),
+    ],
+    ids=["with-weight-version", "without-weight-version"],
+)
+def test_output_processor_forwards_weight_version_when_supported(
+    monkeypatch, factory, expected
+):
+    calls = []
+    module = factory(calls)
+    patch_output_processor.apply_to_module(module)
+    processor = module.OutputProcessor()
+    processor.request_states = {"r": SimpleNamespace(is_prefilling=True)}
+    output = SimpleNamespace(request_id="r", kv_transfer_params={})
+    monkeypatch.setattr(
+        patch_output_processor.henvs, "VLLM_HCU_MOONCAKE_TTFT_TRACE", False
+    )
+    assert processor.process_outputs([output], weight_version="v2") == "result"
+    assert calls == expected
+
+
 def test_hcu_multiproc_executor_sizes_message_queue_from_v0251_config(monkeypatch):
     from vllm_hcu.v1.executor import multiproc_executor as hcu_executor
 
@@ -774,8 +817,9 @@ import vllm
 from vllm_hcu.version import __vllm_target_version__
 target_root = Path(os.environ['VLLM_SOURCE_ROOT']).resolve()
 assert Path(vllm.__file__).resolve().is_relative_to(target_root)
-assert Version(vllm.__version__).release[:3] == (0, 28, 1)
-assert Version(__vllm_target_version__).release[:3] == (0, 28, 1)
+target_version = Version(__vllm_target_version__).release[:3]
+assert target_version == (0, 32, 0)
+assert Version(vllm.__version__).release[:3] == target_version
 assert 'VLLM_V0251_SOURCE_ROOT' not in os.environ
 from vllm_hcu.patch.platform.framework_opt import (
     patch_kv_connector_factory, patch_outputs,

@@ -1,10 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-"""CPU regressions for the scope of Step5 optimizations."""
+"""CPU regressions for Step5 optimization and shared-loader scope."""
+import hashlib
+import inspect
+import sys
+import textwrap
 from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
+
+from vllm_hcu.patch.worker.framework_opt import patch_step5_mtp_heads as adapter
+from vllm_hcu.runtime_compat.step5_patch_contract import Step5PatchCompatibilityError
 
 
 @pytest.mark.parametrize(
@@ -109,3 +116,101 @@ def test_eplb_metric_handles_replicas_and_zero_load(layerwise):
     loads = torch.tensor([[8.0, 4.0]])
     assert _rank_load_imbalance(mapping, loads, 2, layerwise=layerwise) == 1.0
     assert _rank_load_imbalance(mapping, loads * 0, 2, layerwise=layerwise) == 1.0
+
+
+def _mtp_config(model_type, architectures=None, nested=False):
+    hf = SimpleNamespace(model_type=model_type, architectures=architectures)
+    if nested:
+        hf = SimpleNamespace(text_config=hf, architectures=architectures)
+    return SimpleNamespace(model_config=SimpleNamespace(hf_config=hf))
+
+
+@pytest.fixture
+def mtp_loaders(monkeypatch):
+    def loader(module_name):
+        module = ModuleType(module_name)
+        calls, result = [], object()
+
+        def load_eagle_model(target_model, vllm_config):
+            calls.append((target_model, vllm_config))
+            return result
+
+        module.load_eagle_model = load_eagle_model
+        return SimpleNamespace(module=module, calls=calls, result=result)
+
+    native = loader(adapter.TARGET_MODULE)
+    owned = loader("vllm_hcu.v1.step5_mtp_loading")
+    monkeypatch.setitem(sys.modules, owned.module.__name__, owned.module)
+    return native, owned
+
+
+@pytest.mark.parametrize("model_type,reviewed", [
+    ("deepseek_v41", False), ("deepseek_v4", False), ("llama", False),
+    ("step5", True), ("step5_mtp", True),
+])
+def test_mtp_loader_dispatch_preserves_identity(
+    monkeypatch, mtp_loaders, model_type, reviewed
+):
+    native, owned = mtp_loaders
+    original = native.module.load_eagle_model
+    if reviewed:
+        # Exercise the real inspect/dedent/SHA256 audit with reviewed fixture code.
+        source = textwrap.dedent(inspect.getsource(original))
+        digest = hashlib.sha256(source.encode()).hexdigest()
+        monkeypatch.setattr(
+            adapter, "REVIEWED_SOURCES", ((adapter.TARGETS[0], (digest,)),)
+        )
+    assert adapter.apply_to_module(native.module) is True
+    model, config = object(), _mtp_config(model_type)
+    expected, other = (owned, native) if reviewed else (native, owned)
+    assert native.module.load_eagle_model(model, config) is expected.result
+    assert expected.calls == [(model, config)] and not other.calls
+    assert inspect.unwrap(native.module.load_eagle_model) is original
+    installed = native.module.load_eagle_model
+    assert adapter.apply_to_module(native.module) is False
+    assert native.module.load_eagle_model is installed
+
+
+@pytest.mark.parametrize("model_type,architectures,nested", [
+    ("step5", None, False), ("step5_mtp", None, False),
+    ("step5", None, True), ("other", ["Step5ForConditionalGeneration"], False),
+])
+def test_mtp_unknown_step5_source_is_rejected_before_owned_loader(
+    mtp_loaders, model_type, architectures, nested
+):
+    native, owned = mtp_loaders
+    assert adapter.apply_to_module(native.module) is True
+    with pytest.raises(Step5PatchCompatibilityError, match="Unreviewed Step5 target source"):
+        native.module.load_eagle_model(
+            object(), _mtp_config(model_type, architectures, nested)
+        )
+    assert not native.calls and not owned.calls
+
+
+@pytest.mark.parametrize("failure,match", [("signature", "signature"), ("stale", "Stale")])
+def test_mtp_loader_rejects_incompatible_installation(mtp_loaders, failure, match):
+    native, _ = mtp_loaders
+    if failure == "stale":
+        assert adapter.apply_to_module(native.module) is True
+        native.module.load_eagle_model = lambda target_model, vllm_config: None
+    else:
+        native.module.load_eagle_model = lambda incompatible: None
+    with pytest.raises(Step5PatchCompatibilityError, match=match):
+        adapter.apply_to_module(native.module)
+    if failure == "signature":
+        assert not hasattr(native.module, adapter._MARKER)
+
+
+def test_mtp_non_step5_original_error_propagates(mtp_loaders):
+    native, owned = mtp_loaders
+    error = ValueError("original loader failure")
+
+    def load_eagle_model(target_model, vllm_config):
+        raise error
+
+    native.module.load_eagle_model = load_eagle_model
+    assert adapter.apply_to_module(native.module) is True
+    with pytest.raises(ValueError) as caught:
+        native.module.load_eagle_model(object(), _mtp_config("deepseek_v41"))
+    assert caught.value is error
+    assert not owned.calls

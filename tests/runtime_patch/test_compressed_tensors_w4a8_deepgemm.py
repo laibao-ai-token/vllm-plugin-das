@@ -6,6 +6,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm.distributed.parallel_state import get_ep_group
+
 from vllm_hcu.model_executor.layers.quantization.compressed_tensors_w4a8_deepgemm import (
     HCUCompressedTensorsW4A8Int8MoEMethod,
     convert_ct_int4_to_hipc_bytes_,
@@ -36,6 +38,41 @@ def _args():
         in_dtype=torch.bfloat16, swiglu_limit=10.0,
     )
     return weight, act, moe
+
+
+def _topology_case(*, dp=8, pcp=1, graph=True, dspark=False):
+    backend = "deepep_low_latency" if pcp == 1 else "deepep_high_throughput"
+    capacity = 256 if pcp == 1 else 8192
+    parallel = SimpleNamespace(
+        tensor_parallel_size=1, pipeline_parallel_size=1,
+        decode_context_parallel_size=1, prefill_context_parallel_size=pcp,
+        data_parallel_size=dp, enable_expert_parallel=True,
+        enable_eplb=False, enable_elastic_ep=False, all2all_backend=backend,
+    )
+    config = SimpleNamespace(
+        parallel_config=parallel,
+        model_config=SimpleNamespace(enforce_eager=not graph, hf_config=SimpleNamespace(
+            model_type="deepseek_v41", architectures=["DeepseekV41ForCausalLM"])),
+        speculative_config=None,
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=capacity, max_num_seqs=32),
+        compilation_config=SimpleNamespace(
+            cudagraph_capture_sizes=[1, 2, 4, 8], max_cudagraph_capture_size=8,
+            cudagraph_mode=SimpleNamespace(name="FULL_AND_PIECEWISE")),
+        lora_config=None,
+    )
+    if dspark:
+        config.speculative_config = SimpleNamespace(
+            method="dspark", num_speculative_tokens=5, target_parallel_config=parallel,
+            draft_model_config=SimpleNamespace(enforce_eager=not graph,
+                hf_config=SimpleNamespace(model_type="deepseek_v41", sample_from_anchor=True)),
+        )
+    _, _, moe = _args()
+    moe.moe_parallel_config = SimpleNamespace(
+        tp_size=1, pcp_size=pcp, dp_size=dp, ep_size=dp,
+        use_ep=True, all2all_backend=backend,
+    )
+    moe.max_num_tokens, moe.max_capture_size = capacity, 8
+    return config, moe
 
 
 def _layer():
@@ -138,7 +175,7 @@ def test_routing_patch_selects_ct_w4a8_and_delegates_other_schemes(monkeypatch):
     from vllm_hcu.patch.worker.op_opt import patch_compressed_tensors_moe_w4a8 as patch
     import vllm.config
     import vllm_hcu.deepseek_v4_runtime
-    weight, act, moe = _args()
+    weight, act, _ = _args()
     module = ModuleType(patch.TARGET_MODULE)
     upstream_result = object()
     class Original:
@@ -147,14 +184,7 @@ def test_routing_patch_selects_ct_w4a8_and_delegates_other_schemes(monkeypatch):
             return upstream_result
     module.CompressedTensorsMoEMethod = Original
     module.current_platform = SimpleNamespace(is_rocm=lambda: True)
-    config = SimpleNamespace(
-        parallel_config=SimpleNamespace(tensor_parallel_size=1, pipeline_parallel_size=1,
-                                        decode_context_parallel_size=1,
-                                        prefill_context_parallel_size=8, data_parallel_size=1,
-                                        enable_eplb=False),
-        model_config=SimpleNamespace(enforce_eager=True),
-        lora_config=None,
-    )
+    config, moe = _topology_case(dp=1, pcp=8, graph=False)
     monkeypatch.setattr(vllm.config, "get_current_vllm_config", lambda: config)
     monkeypatch.setattr(vllm_hcu.deepseek_v4_runtime, "model_architectures",
                         lambda _: ("DeepseekV41ForCausalLM",))
@@ -404,31 +434,183 @@ def test_ll_postload_capacity_dispatchers_and_forward_limit(monkeypatch, drift):
     assert calls == [0, 4]
 
 
-@pytest.mark.parametrize("draft,graph", [(False, False), (True, False), (False, True), (True, True)])
-def test_decode_and_draft_dp8_remain_gated_without_reviewed_common_contract(draft, graph):
+@pytest.mark.parametrize("dp", [4, 8, 16])
+@pytest.mark.parametrize("graph", [False, True])
+def test_decode_dp_widths_admitted_by_invariants(dp, graph):
+    """General CT admission is independent of native DSpark's DP8 predicate."""
+    from vllm_hcu import dspark_runtime as draft
     from vllm_hcu.patch.worker.op_opt import patch_compressed_tensors_moe_w4a8 as routing
-    _, _, moe = _args()
-    moe.moe_parallel_config.all2all_backend = "allgather_reducescatter" if draft else "deepep_low_latency"
-    moe.moe_parallel_config.tp_size = moe.moe_parallel_config.pcp_size = 1
-    moe.moe_parallel_config.dp_size = moe.moe_parallel_config.ep_size = 8
-    moe.max_num_tokens = 256
-    # A private field is not sufficient evidence to enable a topology.
-    moe._hcu_dspark_all2all_manager = object()
-    config = SimpleNamespace(
-        parallel_config=SimpleNamespace(tensor_parallel_size=1, pipeline_parallel_size=1,
-            decode_context_parallel_size=1, prefill_context_parallel_size=1,
-            data_parallel_size=8, enable_eplb=False),
-        scheduler_config=SimpleNamespace(max_num_batched_tokens=256),
-        model_config=SimpleNamespace(enforce_eager=not graph), lora_config=None,
-    )
-    reason = "graph_contract=unverified" if graph else (
-        "draft_group_capacity_contract=unverified" if draft else "decode_common_contract=unverified")
-    if draft and graph:
-        config.model_config.enforce_eager = True
-        config.speculative_config = SimpleNamespace(draft_model_config=SimpleNamespace(enforce_eager=False))
-        reason = "draft_graph_contract=unverified"
+    config, moe = _topology_case(dp=dp, graph=graph)
+    assert not draft.native_decode_dspark(config)
+    routing._validate_topology(config, moe, False)
+
+
+@pytest.mark.parametrize("dp", [4, 8, 16])
+def test_native_dspark_dp8_predicate_and_concrete_capacity(dp):
+    from vllm_hcu import dspark_runtime as draft
+    from vllm_hcu.patch.worker.op_opt import patch_compressed_tensors_moe_w4a8 as routing
+    config, moe = _topology_case(dp=dp, dspark=True)
+    routing._validate_topology(config, moe, False)
+    bounds = draft.token_capacity(config)
+    assert (bounds.query_tokens_per_rank, bounds.verify_tokens_per_rank,
+            bounds.capacity_per_rank) == (160, 192, 256)
+    assert draft.native_decode_dspark(config) is (dp == 8)
+
+
+@pytest.mark.parametrize("mutation,reason", [
+    ("dp", "moe_dp_size_mismatch"),
+    ("ep", "moe_ep_size_mismatch"),
+    ("backend", "decode_requires_fixed_ll_ep"),
+    ("capacity", "moe_capacity_must_match_scheduler"),
+    ("graph", "graph capture exceeds scheduler capacity"),
+    ("graph_mode", "graph capture requires known mode"),
+    ("query", "DSpark token capacity is insufficient"),
+    ("lora", "lora!=None"),
+    ("eplb", "eplb=True"),
+])
+def test_decode_rejects_broken_invariants(mutation, reason):
+    from vllm_hcu.patch.worker.op_opt import patch_compressed_tensors_moe_w4a8 as routing
+    config, moe = _topology_case(dspark=mutation == "query")
+    if mutation == "dp":
+        moe.moe_parallel_config.dp_size = 4
+    elif mutation == "ep":
+        moe.moe_parallel_config.ep_size = 4
+    elif mutation == "backend":
+        moe.moe_parallel_config.all2all_backend = "deepep_high_throughput"
+    elif mutation == "capacity":
+        moe.max_num_tokens = 255
+    elif mutation == "graph":
+        config.compilation_config.cudagraph_capture_sizes = [512]
+    elif mutation == "graph_mode":
+        config.compilation_config.cudagraph_mode = SimpleNamespace(name="UNKNOWN")
+    elif mutation == "query":
+        config.scheduler_config.max_num_seqs = 64
+    elif mutation == "lora":
+        config.lora_config = object()
+    elif mutation == "eplb":
+        config.parallel_config.enable_eplb = True
     with pytest.raises(ValueError, match=reason):
-        routing._validate_topology(config, moe, draft)
+        routing._validate_topology(config, moe, False)
+
+
+def test_prefill_pcp8_still_requires_eager():
+    """PCP's virtual batch cannot be graph-captured; keep the real constraint."""
+    from vllm_hcu.patch.worker.op_opt import patch_compressed_tensors_moe_w4a8 as routing
+    config, moe = _topology_case(dp=1, pcp=8)
+    with pytest.raises(ValueError, match="enforce_eager=False"):
+        routing._validate_topology(config, moe, False)
+
+
+def test_private_field_is_not_a_draft_ownership_contract():
+    from vllm_hcu.patch.worker.op_opt import patch_compressed_tensors_moe_w4a8 as routing
+    config, moe = _topology_case(dspark=True)
+    config.parallel_config.all2all_backend = "allgather_reducescatter"
+    moe.moe_parallel_config.all2all_backend = "allgather_reducescatter"
+    moe._hcu_dspark_all2all_manager = object()
+    with pytest.raises(ValueError, match="draft.*(manager|scope)"):
+        routing._validate_topology(config, moe, True)
+
+
+def test_draft_manager_binding_covers_allocation_and_both_collectives():
+    from vllm_hcu import dspark_runtime as draft
+
+    class PF:
+        def prepare(self):
+            return get_ep_group().dispatch()
+
+        def _allocate_combine_input(self):
+            return get_ep_group().allocate_combine_input()
+
+        def finalize(self):
+            return get_ep_group().combine_into_output()
+
+    manager = SimpleNamespace(dispatch=lambda: "draft_dispatch",
+                              allocate_combine_input=lambda: "draft_alloc",
+                              combine_into_output=lambda: "draft_combine")
+    pf = PF()
+    assert draft.bind_draft_prepare_finalize(pf, manager) is pf
+    assert (pf.prepare(), pf._allocate_combine_input(), pf.finalize()) == (
+        "draft_dispatch", "draft_alloc", "draft_combine")
+    methods = (pf.prepare, pf._allocate_combine_input, pf.finalize)
+    assert draft.bind_draft_prepare_finalize(pf, manager) is pf
+    assert (pf.prepare, pf._allocate_combine_input, pf.finalize) == methods
+    with pytest.raises(RuntimeError, match="manager changed"):
+        draft.bind_draft_prepare_finalize(pf, object())
+    assert (pf.prepare, pf._allocate_combine_input, pf.finalize) == methods
+    assert (pf.prepare(), pf._allocate_combine_input(), pf.finalize()) == (
+        "draft_dispatch", "draft_alloc", "draft_combine")
+
+
+@pytest.mark.parametrize("static_ep", [False, True])
+def test_combine_finalize_uses_draft_group_and_restores_scope_on_failure(monkeypatch, static_ep):
+    from contextlib import nullcontext
+    from vllm.distributed import parallel_state
+    from vllm_hcu import dspark_runtime as draft
+    from vllm_hcu.model_executor.layers.fused_moe import combine_runtime
+
+    calls = []
+    target_manager = SimpleNamespace(name="target", offset=10.0, fail=False)
+    manager = SimpleNamespace(name="draft", offset=20.0, fail=False)
+
+    class Group:
+        def __init__(self):
+            self.device_communicator = SimpleNamespace(all2all_manager=target_manager)
+
+        def combine(self, out, is_sequence_parallel=False):
+            active = self.device_communicator.all2all_manager
+            calls.append((active.name, is_sequence_parallel))
+            if active.fail:
+                raise RuntimeError("synthetic draft combine failure")
+            return out + active.offset
+
+    target = Group()
+    state = SimpleNamespace(_EP=target)
+    config, moe = _topology_case(dspark=True)
+    scope = draft.DSparkDraftScope(config, config, target, manager, state,
+                                   lambda cfg: nullcontext(), draft.token_capacity(config))
+    scope.static_ep = static_ep
+    monkeypatch.setattr(parallel_state, "get_ep_group", lambda: state._EP)
+    monkeypatch.setattr(combine_runtime, "_combine_hook", None)
+    assert combine_runtime.get_active_ep_group() is None
+    assert draft.get_dspark_token_capacity() is None
+    assert draft.get_dspark_all2all_manager(moe) is None
+
+    values = torch.arange(1.0, 9.0, device="cpu").view(2, 2, 2)
+    weights = torch.tensor([[0.25, 0.75], [0.5, 0.5]], device="cpu")
+    ids = torch.tensor([[0, 1], [1, 0]], device="cpu")
+    reduced = torch.tensor([[2.5, 3.5], [6.0, 7.0]], device="cpu")
+    output = torch.empty_like(reduced)
+
+    def reduce(_, fused_output, topk_weights, topk_ids, apply_router_weight_on_input):
+        assert fused_output is values and topk_weights is weights and topk_ids is ids
+        assert apply_router_weight_on_input is False
+        return (fused_output * topk_weights.unsqueeze(-1)).sum(dim=1)
+
+    def finalize():
+        return combine_runtime.finalize(
+            SimpleNamespace(is_sequence_parallel=False), output, values, weights, ids,
+            False, SimpleNamespace(apply=reduce))
+
+    assert finalize() is None
+    torch.testing.assert_close(output, reduced + target_manager.offset, rtol=0, atol=0)
+    with pytest.raises(RuntimeError, match="synthetic draft combine failure"):
+        with scope.activate():
+            assert state._EP is (target if static_ep else scope.draft_ep)
+            assert combine_runtime.get_active_ep_group() is scope.draft_ep
+            assert draft.get_dspark_all2all_manager(moe) is manager
+            assert draft.get_dspark_token_capacity() is scope.capacity
+            assert finalize() is None
+            torch.testing.assert_close(output, reduced + manager.offset, rtol=0, atol=0)
+            manager.fail = True
+            finalize()
+
+    assert state._EP is target
+    assert combine_runtime.get_active_ep_group() is None
+    assert draft.get_dspark_all2all_manager(moe) is None
+    assert draft.get_dspark_token_capacity() is None
+    assert finalize() is None
+    torch.testing.assert_close(output, reduced + target_manager.offset, rtol=0, atol=0)
+    assert calls == [("target", False), ("draft", False), ("draft", False), ("target", False)]
 
 
 @pytest.mark.parametrize("activate_draft", [False, True])
