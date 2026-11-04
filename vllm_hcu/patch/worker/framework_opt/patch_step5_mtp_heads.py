@@ -36,7 +36,9 @@ def apply_to_module(module: ModuleType) -> bool:
     target = load_exact_module(TARGET_MODULE, module)
     if already_applied(target, _MARKER, TARGETS):
         return False
-    require_signatures(target, SIGNATURES, REVIEWED_SOURCES)
+    # The shared loader's pass-through wrapper only depends on its public API.
+    # Audit the source before using the Step5-specific replacement below.
+    require_signatures(target, SIGNATURES)
     import functools
     from vllm_hcu.runtime_compat.step5 import is_step5_config
 
@@ -45,6 +47,7 @@ def apply_to_module(module: ModuleType) -> bool:
     @functools.wraps(original)
     def load_eagle_model(target_model, vllm_config):
         if is_step5_config(vllm_config):
+            require_signatures(target, (), REVIEWED_SOURCES)
             from vllm_hcu.v1.step5_mtp_loading import load_eagle_model as load_step5
 
             return load_step5(target_model, vllm_config)

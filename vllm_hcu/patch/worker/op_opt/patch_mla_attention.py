@@ -58,12 +58,12 @@ def apply_to_module(module: ModuleType) -> bool:
                     "v_head_dim", "q_lora_rank", "kv_lora_rank", "kv_b_proj",
                     "dcp_q_replicate", "cache_config", "quant_config", "prefix",
                     "attn_backend", "use_sparse", "indexer", "topk_indices_buffer",
-                    "non_causal_multi_token_decode", "sliding_window",
+                    "index_group_builder", "non_causal_multi_token_decode", "sliding_window",
                     "prefill_backend_cls"),
         defaults={"dcp_q_replicate": False, "cache_config": None,
                   "quant_config": None, "prefix": "",
                   "attn_backend": None, "use_sparse": False, "indexer": None,
-                  "topk_indices_buffer": None,
+                  "topk_indices_buffer": None, "index_group_builder": None,
                   "non_causal_multi_token_decode": False,
                   "sliding_window": None, "prefill_backend_cls": None},
         var_keyword="extra_impl_args",
@@ -121,7 +121,9 @@ def apply_to_module(module: ModuleType) -> bool:
             "slot_mapping",
             "num_decode_tokens",
             "use_pcp",
+            "pcp_shard_decode_requests",
         ),
+        defaults={"pcp_shard_decode_requests": False},
     )
     require_exact_signature(
         original_forward, TARGETS[2],
@@ -459,6 +461,7 @@ def apply_to_module(module: ModuleType) -> bool:
         slot_mapping,
         num_decode_tokens,
         use_pcp,
+        pcp_shard_decode_requests=False,
     ):
         from vllm_hcu.model_executor.layers.attention.pcp import (
             current_pcp_cache_ownership_metadata,
@@ -466,6 +469,15 @@ def apply_to_module(module: ModuleType) -> bool:
             maybe_gather_mla_latent_cache_inputs as gather_owned_cache_inputs,
         )
 
+        if pcp_shard_decode_requests:
+            if current_pcp_cache_ownership_metadata() is not None:
+                raise NotImplementedError(
+                    "HCU owned-cache gather does not support sharded decode requests"
+                )
+            return original_cache_gather(
+                kv_c_normed, k_pe, slot_mapping, num_decode_tokens, use_pcp,
+                pcp_shard_decode_requests=True,
+            )
         if in_replicated_mtp_batch():
             return kv_c_normed, k_pe, slot_mapping
         ownership_metadata = current_pcp_cache_ownership_metadata()
@@ -497,6 +509,7 @@ def apply_to_module(module: ModuleType) -> bool:
             slot_mapping,
             num_decode_tokens,
             use_pcp,
+            pcp_shard_decode_requests=pcp_shard_decode_requests,
         )
 
     @functools.wraps(original_use_sparse_mha)

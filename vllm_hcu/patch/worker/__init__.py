@@ -157,6 +157,7 @@ _OP_REPLACEMENTS: tuple[_ReplacementSpec, ...] = (
             "vllm._aiter_ops.rocm_aiter_ops.is_fp8bmm_enabled",
             "vllm._aiter_ops._rocm_aiter_rmsnorm_fused_dynamic_quant_impl",
             "vllm._aiter_ops._rocm_aiter_rmsnorm_fused_add_dynamic_quant_impl",
+            "vllm._aiter_ops.rocm_aiter_ops.is_triton_sparse_mla_enabled",
         ),
     ),
 )

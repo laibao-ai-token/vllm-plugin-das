@@ -34,6 +34,10 @@ _V028_VERIFY_SOURCE_SHA256 = (
 )
 
 
+class _AuditedVerifierMismatch(PatchCompatibilityError):
+    """A present verifier differs from the reviewed signature/source contract."""
+
+
 def _require_source_fingerprint(function, target: str, expected: str) -> None:
     try:
         source = textwrap.dedent(inspect.getsource(function))
@@ -45,7 +49,7 @@ def _require_source_fingerprint(function, target: str, expected: str) -> None:
         ) from exc
     actual = hashlib.sha256(source.encode("utf-8")).hexdigest()
     if actual != expected:
-        raise PatchCompatibilityError(
+        raise _AuditedVerifierMismatch(
             f"required HCU patch target {target} source fingerprint "
             f"mismatch: expected sha256={expected}, actual sha256={actual}"
         )
@@ -73,17 +77,17 @@ def _require_audited_verifier(config_class: type):
             inspect.Parameter.POSITIONAL_OR_KEYWORD,
         )
     ):
-        raise PatchCompatibilityError(
+        raise _AuditedVerifierMismatch(
             f"required HCU patch target {TARGETS[0]} has incompatible signature "
             f"{inspect.signature(verifier)}"
         )
     code = getattr(verifier, "__code__", None)
     if code is None or not _REQUIRED_NAMES.issubset(code.co_names):
-        raise PatchCompatibilityError(
+        raise _AuditedVerifierMismatch(
             f"required HCU patch target {TARGETS[0]} has incompatible source contract"
         )
     if _REQUIRED_CONSTANT not in code.co_consts:
-        raise PatchCompatibilityError(
+        raise _AuditedVerifierMismatch(
             f"required HCU patch target {TARGETS[0]} no longer has the audited "
             "Qwen4Exp PLE pipeline guard"
         )
@@ -109,7 +113,13 @@ def apply_to_module(module: ModuleType) -> bool:
                 f"required HCU patch marker for {TARGETS[0]} is stale"
             )
         return False
-    verifier = _require_audited_verifier(config_class)
+    try:
+        verifier = _require_audited_verifier(config_class)
+    except _AuditedVerifierMismatch:
+        # Qwen PLE PP is outside the current V41 eager/no-spec path. Keep
+        # native validation on drift: temporary PP=1 could bypass the new
+        # MoE-SP PP restriction. No wrapper or owner marker is installed.
+        return False
 
     @functools.wraps(verifier)
     def hcu_verify_and_update_config(vllm_config) -> None:

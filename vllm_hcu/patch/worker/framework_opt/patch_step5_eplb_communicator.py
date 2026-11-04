@@ -8,6 +8,7 @@ from functools import wraps
 from types import ModuleType
 
 from vllm_hcu.runtime_compat.step5_patch_contract import (
+    Step5PatchCompatibilityError,
     already_applied,
     remember_targets,
     require_signatures,
@@ -31,7 +32,17 @@ def apply_to_module(module: ModuleType) -> bool:
     target = load_exact_module(TARGET_MODULE, module)
     if already_applied(target, _MARKER, TARGETS):
         return False
-    require_signatures(target, SIGNATURES, REVIEWED_SOURCES)
+    try:
+        require_signatures(target, SIGNATURES, REVIEWED_SOURCES)
+    except Step5PatchCompatibilityError as exc:
+        if not str(exc).startswith(
+            ("Incompatible Step5 target signature: ", "Unreviewed Step5 target source: ")
+        ):
+            raise
+        # The current V41 eager startup has no EPLB; preserve native communicator
+        # semantics when this Step5-only source/signature contract has drifted.
+        # Skip before runtime imports, target writes, and owner markers.
+        return False
     original = target.create_eplb_communicator
     from vllm_hcu.distributed.eplb_buffer_runtime import (
         create_communicator_with_buffers,

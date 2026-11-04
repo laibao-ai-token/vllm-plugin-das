@@ -555,6 +555,19 @@ def _resolve_decoder_forward(model_module: ModuleType, decoder_class: type) -> b
     return True
 
 
+def _optional_contract_drift(exc: PatchCompatibilityError) -> bool:
+    """Identify audited Qwen4Exp source/signature drift that can stay native."""
+    text = str(exc)
+    return any(
+        marker in text
+        for marker in (
+            "source fingerprint mismatch",
+            "has incompatible signature",
+            "has 0 sequence-parallel MoE guards",
+        )
+    )
+
+
 def apply_to_module(module: ModuleType) -> bool:
     model_module = load_exact_module(TARGET_MODULE, module)
     moe_class, decoder_class, model_class = (
@@ -580,24 +593,32 @@ def apply_to_module(module: ModuleType) -> bool:
             "refusing a partial Qwen4Exp sequence-parallel patch"
         )
 
-    # Validate and build everything before installing anything.
-    _, moe_init = _rebuild_init_without_guard(moe_class, TARGETS[0])
-    _, guardless_decoder_init = _rebuild_init_without_guard(decoder_class, TARGETS[1])
-    require_exact_signature(
-        guardless_decoder_init,
-        TARGETS[1],
-        positional=("self", "vllm_config", "layer_type", "prefix"),
-        defaults={"prefix": ""},
-    )
-    decoder_init = _make_decoder_init(guardless_decoder_init)
-    fused_ple = _resolve_decoder_forward(model_module, decoder_class)
-    model_init = _make_model_init(
-        _require_model_init_compatible(model_class, TARGETS[3])
-    )
-    _replacement_forward(
-        model_class, "Qwen4ExpModel.forward", TARGETS[4], model_forward
-    )
-    _bind_runtime_names(model_module)
+    # Validate and build everything before installing anything.  The Qwen4Exp
+    # sequence-parallel adapter is optional; when the audited upstream body
+    # moved in a newer core, leave the native implementation untouched so an
+    # unrelated model can still initialize.
+    try:
+        _, moe_init = _rebuild_init_without_guard(moe_class, TARGETS[0])
+        _, guardless_decoder_init = _rebuild_init_without_guard(decoder_class, TARGETS[1])
+        require_exact_signature(
+            guardless_decoder_init,
+            TARGETS[1],
+            positional=("self", "vllm_config", "layer_type", "prefix"),
+            defaults={"prefix": ""},
+        )
+        decoder_init = _make_decoder_init(guardless_decoder_init)
+        fused_ple = _resolve_decoder_forward(model_module, decoder_class)
+        model_init = _make_model_init(
+            _require_model_init_compatible(model_class, TARGETS[3])
+        )
+        _replacement_forward(
+            model_class, "Qwen4ExpModel.forward", TARGETS[4], model_forward
+        )
+        _bind_runtime_names(model_module)
+    except PatchCompatibilityError as exc:
+        if _optional_contract_drift(exc):
+            return False
+        raise
     global _fused_ple
     _fused_ple = fused_ple
 

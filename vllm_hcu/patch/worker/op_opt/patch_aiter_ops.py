@@ -30,6 +30,7 @@ TARGETS = (
     f"{TARGET_MODULE}.rocm_aiter_ops.is_fp8bmm_enabled",
     f"{TARGET_MODULE}._rocm_aiter_rmsnorm_fused_dynamic_quant_impl",
     f"{TARGET_MODULE}._rocm_aiter_rmsnorm_fused_add_dynamic_quant_impl",
+    f"{TARGET_MODULE}.rocm_aiter_ops.is_triton_sparse_mla_enabled",
 )
 
 _REPLACEMENT_MARKER = "_vllm_hcu_aiter_ops_replacement"
@@ -216,6 +217,21 @@ def _validate(module: ModuleType) -> None:
     ):
         raise PatchCompatibilityError(
             f"required HCU target {TARGETS[4]} must remain a staticmethod"
+        )
+    # v0.32 calls this gate from the DeepSeek V4/V4.1 ROCm attention path.  The
+    # cold replacement must expose it with the same zero-argument classmethod
+    # binding; a missing gate would surface as AttributeError much later.
+    triton_sparse_mla = require_callable(
+        aiter_class,
+        "is_triton_sparse_mla_enabled",
+        TARGETS[10],
+    )
+    require_exact_signature(triton_sparse_mla, TARGETS[10], positional=())
+    if not isinstance(
+        vars(aiter_class).get("is_triton_sparse_mla_enabled"), classmethod
+    ):
+        raise PatchCompatibilityError(
+            f"required HCU target {TARGETS[10]} must remain a classmethod"
         )
 
 

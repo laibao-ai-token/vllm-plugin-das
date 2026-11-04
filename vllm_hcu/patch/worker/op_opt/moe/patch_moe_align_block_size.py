@@ -212,6 +212,7 @@ def apply_to_module(module: ModuleType) -> bool:
             "expert_map",
             "pad_sorted_ids",
             "ignore_invalid_experts",
+            "return_scatter_idx",
         ),
     )
 
@@ -223,7 +224,16 @@ def apply_to_module(module: ModuleType) -> bool:
         expert_map=None,
         pad_sorted_ids=False,
         ignore_invalid_experts=False,
+        return_scatter_idx=False,
     ):
+        if return_scatter_idx:
+            # The reviewed HT path keeps the three-result default. Preserve
+            # native four-result semantics without inventing an HCU scatter op.
+            return original(
+                topk_ids, block_size, num_experts, expert_map,
+                pad_sorted_ids, ignore_invalid_experts,
+                return_scatter_idx=True,
+            )
         from vllm_hcu.platforms import envs as henvs
 
         enabled = bool(

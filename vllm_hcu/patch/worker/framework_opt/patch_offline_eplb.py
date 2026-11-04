@@ -380,43 +380,56 @@ def apply_to_module(module) -> bool:
         original_commit,
         original_transfer,
     ) = originals
-    require_exact_signature(
-        original_add,
-        TARGETS[0],
-        positional=("self", "model", "model_config"),
-    )
-    require_exact_signature(
-        original_step,
-        TARGETS[1],
-        positional=("self", "is_dummy", "is_profile", "log_stats"),
-        defaults={"is_dummy": False, "is_profile": False, "log_stats": False},
-    )
-    require_exact_signature(
-        original_rearrange,
-        TARGETS[2],
-        positional=("self", "is_profile", "rank_mapping"),
-        defaults={"is_profile": False, "rank_mapping": None},
-    )
-    require_exact_signature(
-        original_commit,
-        TARGETS[3],
-        positional=("model_state", "new_physical_to_logical_map"),
-    )
-    require_exact_signature(
-        original_transfer,
-        TARGETS[4],
-        positional=(
-            "old_global_expert_indices",
-            "new_global_expert_indices",
-            "expert_weights",
-            "expert_buffer",
-            "ep_group",
-            "communicator",
-            "is_profile",
-            "rank_mapping",
-        ),
-        defaults={"is_profile": False, "rank_mapping": None},
-    )
+    # The current V41 eager startup has no offline EPLB. Preflight all five
+    # originals as one unit: when Step5 skips, raw-core rearrange may also drift.
+    # No wrapper, policy marker or refreshed Step5 owner is written on mismatch.
+    try:
+        require_exact_signature(
+            original_add,
+            TARGETS[0],
+            positional=("self", "model", "model_config"),
+        )
+        require_exact_signature(
+            original_step,
+            TARGETS[1],
+            positional=("self", "is_dummy", "is_profile", "log_stats"),
+            defaults={"is_dummy": False, "is_profile": False, "log_stats": False},
+        )
+        require_exact_signature(
+            original_rearrange,
+            TARGETS[2],
+            positional=("self", "is_profile", "rank_mapping"),
+            defaults={"is_profile": False, "rank_mapping": None},
+        )
+        require_exact_signature(
+            original_commit,
+            TARGETS[3],
+            positional=("model_state", "new_physical_to_logical_map"),
+        )
+        require_exact_signature(
+            original_transfer,
+            TARGETS[4],
+            positional=(
+                "old_global_expert_indices",
+                "new_global_expert_indices",
+                "expert_weights",
+                "expert_buffer",
+                "ep_group",
+                "communicator",
+                "is_profile",
+                "rank_mapping",
+            ),
+            defaults={"is_profile": False, "rank_mapping": None},
+        )
+    except PatchCompatibilityError as exc:
+        if not str(exc).startswith(
+            tuple(
+                f"required HCU patch target {symbol} has incompatible signature "
+                for symbol in TARGETS
+            )
+        ):
+            raise
+        return False
 
     @functools.wraps(original_add)
     def add_model(self, model, model_config):

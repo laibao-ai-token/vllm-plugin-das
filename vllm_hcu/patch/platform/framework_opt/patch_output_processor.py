@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import functools
+import inspect
 from types import ModuleType
 
 from vllm_hcu.platforms import envs as henvs
@@ -18,6 +19,22 @@ _MARKER = "_vllm_hcu_output_processor_ttft_applied"
 _WRAPPER = "_vllm_hcu_output_processor_ttft_wrapper"
 
 
+def _accepts_weight_version(signature: inspect.Signature) -> bool:
+    """True when the audited target can receive ``weight_version``.
+
+    vLLM added ``weight_version`` to ``process_outputs`` after v0.28, and both
+    v0.32 call sites pass it by keyword.  A target that predates the parameter
+    must keep working, so the wrapper always accepts the keyword and forwards it
+    only where the original signature can consume it.
+    """
+    parameters = signature.parameters.values()
+    return any(
+        parameter.name == "weight_version"
+        or parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters
+    )
+
+
 def apply_to_module(module: ModuleType) -> bool:
     target = load_exact_module(TARGET_MODULE, module)
     output_processor = require_class(target, "OutputProcessor", f"{TARGET_MODULE}.OutputProcessor")
@@ -28,11 +45,12 @@ def apply_to_module(module: ModuleType) -> bool:
                 "HCU OutputProcessor TTFT marker is stale; restart the process"
             )
         return False
-    require_signature_prefix(
+    signature = require_signature_prefix(
         process_outputs,
         TARGETS[0],
         ("self", "engine_core_outputs", "engine_core_timestamp", "iteration_stats"),
     )
+    forwards_weight_version = _accepts_weight_version(signature)
 
     @functools.wraps(process_outputs)
     def hcu_process_outputs(
@@ -40,6 +58,7 @@ def apply_to_module(module: ModuleType) -> bool:
         engine_core_outputs,
         engine_core_timestamp=None,
         iteration_stats=None,
+        weight_version=None,
     ):
         if henvs.VLLM_HCU_MOONCAKE_TTFT_TRACE:
             from vllm_hcu.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector import (
@@ -54,6 +73,14 @@ def apply_to_module(module: ModuleType) -> bool:
                         req_id=output.request_id,
                         kv_params=output.kv_transfer_params,
                     )
+        if forwards_weight_version:
+            return process_outputs(
+                self,
+                engine_core_outputs,
+                engine_core_timestamp,
+                iteration_stats,
+                weight_version=weight_version,
+            )
         return process_outputs(
             self,
             engine_core_outputs,

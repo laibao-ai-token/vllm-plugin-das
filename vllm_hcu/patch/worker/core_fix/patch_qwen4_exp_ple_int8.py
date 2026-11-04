@@ -718,6 +718,12 @@ def _patch_ngram_loader(module: ModuleType) -> bool:
 def apply_to_module(module: ModuleType) -> bool:
     if getattr(module, _MODULE_MARKER, False):
         return False
+    base = getattr(module, "PLEVocabParallelEmbedding", None)
+    if base is None:
+        # PLE storage is a Qwen4Exp-only optional adapter. Newer cores may
+        # remove the AMD PLE class entirely; leave the official module alone
+        # so unrelated models can initialize without this optional feature.
+        return False
     base = require_class(
         module,
         "PLEVocabParallelEmbedding",

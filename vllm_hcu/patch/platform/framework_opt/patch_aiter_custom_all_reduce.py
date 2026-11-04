@@ -67,11 +67,17 @@ def apply_to_module(module: ModuleType) -> bool:
         return False
 
     init = require_callable(cls, "__init__", TARGETS[1])
-    if tuple(inspect.signature(init).parameters) != (
+    init_signature = inspect.signature(init)
+    if tuple(init_signature.parameters) != (
         "self",
         "group",
         "device",
         "max_size",
+        "register_graph_buffers",
+    ) or (
+        init_signature.parameters["register_graph_buffers"].kind
+        is not inspect.Parameter.KEYWORD_ONLY
+        or init_signature.parameters["register_graph_buffers"].default is not True
     ):
         raise PatchCompatibilityError(
             f"required HCU patch target {TARGETS[1]} has incompatible signature "
@@ -95,7 +101,7 @@ def apply_to_module(module: ModuleType) -> bool:
     configured_size = _configured_buffer_size(default_size)
 
     @functools.wraps(init)
-    def hcu_init(self, group, device, max_size=None):
+    def hcu_init(self, group, device, max_size=None, *, register_graph_buffers=True):
         from aiter.dist.device_communicators.custom_all_reduce import (
             CustomAllreduce as _AiterCustomAllreduce,
         )
@@ -115,7 +121,8 @@ def apply_to_module(module: ModuleType) -> bool:
             group,
             device,
             max_size=max_size,
-            enable_register_for_capturing=_env_flag(
+            # A caller's explicit False always wins over the HCU opt-in.
+            enable_register_for_capturing=register_graph_buffers and _env_flag(
                 "AITER_AR_ENABLE_REG_CAPTURE", default=False
             ),
         )

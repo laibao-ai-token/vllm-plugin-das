@@ -228,7 +228,6 @@ def apply_to_module(module: ModuleType) -> bool:
     if tuple(signature.parameters) != (
         "self",
         "uniform_decode_query_len",
-        "tensor_parallel_size",
     ):
         raise PatchCompatibilityError(
             f"required HCU patch target {TARGETS[0]} has incompatible "
@@ -249,37 +248,18 @@ def apply_to_module(module: ModuleType) -> bool:
     cudagraph_modes = _required_cudagraph_modes(cudagraph_mode_type)
 
     @functools.wraps(original)
-    def hcu_adjust_cudagraph_sizes(
-        self,
-        uniform_decode_query_len: int,
-        tensor_parallel_size: int,
-    ):
-        # The process-local binding avoids adding a second serialized copy to
-        # CompilationConfig.__dict__.  VllmConfig.additional_config remains
-        # authoritative and dispatchers rebind after spawn/unpickle.
+    def hcu_adjust_cudagraph_sizes(self, uniform_decode_query_len: int):
         feature_config = _bound_hcu_config(self) or HcuFeatureConfig()
-        pass_config = getattr(self, "pass_config", None)
-        if pass_config is None or not hasattr(pass_config, "enable_sp"):
+        if feature_config.enable_custom_sp and getattr(
+            self, "cudagraph_mode", None
+        ) not in (None, cudagraph_modes[0]):
+            # v0.32 no longer rounds by tensor_parallel_size/enable_sp here.
+            # Do not pretend the old custom-SP graph alignment still works.
             raise PatchCompatibilityError(
-                "CompilationConfig.pass_config.enable_sp is missing"
+                "HCU custom-SP cudagraph alignment is not validated for v0.32"
             )
-
-        # The feature-off path calls upstream directly and is byte-for-byte
-        # behavior equivalent.  For custom-SP, reuse upstream's complete
-        # validation/rounding implementation through its existing enable_sp
-        # branch, restoring the official config immediately afterwards.
-        if (
-            not feature_config.enable_custom_sp
-            or tensor_parallel_size <= 1
-            or pass_config.enable_sp
-        ):
-            return original(self, uniform_decode_query_len, tensor_parallel_size)
-
-        pass_config.enable_sp = True
-        try:
-            return original(self, uniform_decode_query_len, tensor_parallel_size)
-        finally:
-            pass_config.enable_sp = False
+        # The current eager/feature-off path uses the complete native policy.
+        return original(self, uniform_decode_query_len)
 
     @functools.wraps(original_set_splitting_ops)
     def hcu_set_splitting_ops_for_v1(

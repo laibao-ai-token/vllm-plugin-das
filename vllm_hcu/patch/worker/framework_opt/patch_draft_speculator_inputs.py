@@ -8,6 +8,7 @@ import functools
 from types import ModuleType
 
 from ._common import (
+    PatchCompatibilityError,
     already_applied,
     load_exact_module,
     require_callable,
@@ -31,11 +32,21 @@ def apply_to_module(module: ModuleType) -> bool:
     if already_applied(spec, _MARKER, wrapped):
         return False
     original = require_callable(cls, "_copy_request_inputs", TARGETS[0])
-    require_exact_signature(
-        original,
-        TARGETS[0],
-        positional=("self", "num_reqs", "idx_mapping", "temperature", "seeds"),
-    )
+    try:
+        require_exact_signature(
+            original,
+            TARGETS[0],
+            positional=("self", "num_reqs", "idx_mapping", "temperature", "seeds"),
+        )
+    except PatchCompatibilityError as exc:
+        if not str(exc).startswith(
+            f"required HCU patch target {TARGETS[0]} has incompatible signature "
+        ):
+            raise
+        # No speculator is used by the current V41 eager/no-spec startup.
+        # A new dummy_run contract needs a separate semantic review; keep
+        # the native method and do not install wrappers or markers on drift.
+        return False
 
     @functools.wraps(original)
     def hcu_copy_request_inputs(self, num_reqs, idx_mapping, temperature, seeds):

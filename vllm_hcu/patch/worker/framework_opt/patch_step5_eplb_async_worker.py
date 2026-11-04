@@ -7,6 +7,7 @@ from __future__ import annotations
 from types import ModuleType
 
 from vllm_hcu.runtime_compat.step5_patch_contract import (
+    Step5PatchCompatibilityError,
     already_applied,
     remember_targets,
     require_signatures,
@@ -29,7 +30,17 @@ def apply_to_module(module: ModuleType) -> bool:
     target = load_exact_module(TARGET_MODULE, module)
     if already_applied(target, _MARKER, TARGETS):
         return False
-    require_signatures(target, SIGNATURES, REVIEWED_SOURCES)
+    try:
+        require_signatures(target, SIGNATURES, REVIEWED_SOURCES)
+    except Step5PatchCompatibilityError as exc:
+        if not str(exc).startswith(
+            ("Incompatible Step5 target signature: ", "Unreviewed Step5 target source: ")
+        ):
+            raise
+        # The current V41 eager startup has no EPLB. Its cached native transfer
+        # alias can drift even when the preceding Step5 transfer patch skips.
+        # Skip before runtime imports, target writes, and owner markers.
+        return False
     from vllm_hcu.distributed.eplb_transfer_runtime import transfer_layer
 
     target.transfer_layer = transfer_layer

@@ -79,7 +79,17 @@ def apply_to_module(module: ModuleType) -> bool:
         raise Step5PatchCompatibilityError(
             "Install Step5 EPLB runtime before offline EPLB policy; restart the process"
         )
-    require_signatures(target, SIGNATURES, REVIEWED_SOURCES)
+    try:
+        require_signatures(target, SIGNATURES, REVIEWED_SOURCES)
+    except Step5PatchCompatibilityError as exc:
+        if not str(exc).startswith(
+            ("Incompatible Step5 target signature: ", "Unreviewed Step5 target source: ")
+        ):
+            raise
+        # The current V41 eager startup has no EPLB. Preserve native state-machine
+        # semantics, including new last-load handling, on Step5 contract drift.
+        # Skip before runtime imports, target writes, and owner markers.
+        return False
     cls = getattr(target, "EplbState", None)
     for name, symbol in zip(
         ("step", "_propagate_shared_tensors", "rearrange"), TARGETS[:3]

@@ -113,20 +113,21 @@ def apply_to_module(module: ModuleType) -> bool:
         kv_cache_utils, "_annotate_eagle_groups", TARGETS[0]
     )
     signature = inspect.signature(original)
+    expected_tail = "use_deepseek_v4_fallback"
+    parameters = tuple(signature.parameters)
+    # Qwen hybrid-MTP-only adapter. Every wrapper below is a no-op unless
+    # _is_qwen_hybrid_mtp(config) is true. The fixed v0.32 body renamed the
+    # trailing flag to ``use_trailing_layer_fallback``, so this Qwen-specific
+    # annotation no longer has the interface it was audited against. Skip the
+    # adapter entirely rather than failing platform initialization for
+    # non-Qwen models such as the V4.1 target.
     if (
-        tuple(signature.parameters)
-        != (
-            "vllm_config",
-            "kv_cache_spec",
-            "kv_cache_groups",
-            "use_deepseek_v4_fallback",
-        )
-        or signature.parameters["use_deepseek_v4_fallback"].default is not False
+        len(parameters) != 4
+        or parameters[:3] != ("vllm_config", "kv_cache_spec", "kv_cache_groups")
+        or expected_tail not in parameters
+        or signature.parameters[expected_tail].default is not False
     ):
-        raise PatchCompatibilityError(
-            f"required HCU patch target {TARGETS[0]} has incompatible "
-            f"signature {signature}"
-        )
+        return False
     original_get_groups = require_callable(
         kv_cache_utils, "get_kv_cache_groups", TARGETS[1]
     )

@@ -4,6 +4,7 @@
 from __future__ import annotations
 from types import ModuleType
 from vllm_hcu.runtime_compat.step5_patch_contract import (
+    Step5PatchCompatibilityError,
     already_applied,
     remember_targets,
     require_signatures,
@@ -28,7 +29,15 @@ def apply_to_module(module: ModuleType) -> bool:
     target = load_exact_module(TARGET_MODULE, module)
     if already_applied(target, _MARKER, TARGETS):
         return False
-    require_signatures(target, SIGNATURES, REVIEWED_SOURCES)
+    try:
+        require_signatures(target, SIGNATURES, REVIEWED_SOURCES)
+    except Step5PatchCompatibilityError:
+        # Step5-only optional adapter. A core whose module-level graph_capture
+        # has a different signature (e.g. the fixed v0.32 body takes only
+        # ``device`` and already wraps TP/PP/DP groups) simply does not need
+        # this EP capture wrapper. Skip it instead of failing platform
+        # initialization for unrelated models.
+        return False
     import functools
     from contextlib import contextmanager, nullcontext
 
