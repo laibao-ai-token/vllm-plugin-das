@@ -62,32 +62,127 @@ provider = SimpleNamespace(mhc_pre=None, mhc_post=None,
 _registered = False
 
 
+_PROVIDER_PARAMETER_NAMES = {
+    'mhc_pre': (
+        'residual', 'fn', 'hc_scale', 'hc_base', 'rms_eps', 'hc_pre_eps',
+        'hc_sinkhorn_eps', 'hc_post_mult_value', 'sinkhorn_repeat', 'use_tf32',
+    ),
+    'mhc_post': ('out', 'x', 'residual', 'post_layer_mix', 'comb_res_mix'),
+    'mhc_pre_gemm_sqrsum': ('out', 'sqrsum', 'x', 'fn', 'tile_k', 'use_tf32'),
+    'mhc_pre_big_fuse': (
+        'post_mix', 'comb_mix', 'layer_input', 'gemm_out_mul',
+        'gemm_out_sqrsum', 'hc_scale', 'hc_base', 'residual', 'rms_eps',
+        'hc_pre_eps', 'hc_sinkhorn_eps', 'hc_post_mult_value',
+        'sinkhorn_repeat',
+    ),
+}
+
+_PROVIDER_SCHEMA_TYPES = {
+    'mhc_pre': (
+        ('Tensor',) * 4 + ('float',) * 4 + (('SymInt', 'int'),) + ('bool',),
+        ('Tensor',) * 3,
+    ),
+    'mhc_post': (('Tensor',) * 5, ()),
+    'mhc_pre_gemm_sqrsum': (
+        ('Tensor',) * 4 + (('SymInt', 'int'), ('bool',)),
+        (),
+    ),
+    'mhc_pre_big_fuse': (
+        ('Tensor',) * 8 + ('float',) * 4 + (('SymInt', 'int'),),
+        (),
+    ),
+}
+
+
+def _provider_schema(name):
+    """Return the registered Torch schema for a guarded AITER provider."""
+
+    try:
+        overload = getattr(getattr(torch.ops.aiter, name), 'default')
+        return overload._schema
+    except (AttributeError, RuntimeError):
+        return None
+
+
+def _is_generic_provider_signature(signature):
+    parameters = tuple(signature.parameters.values())
+    return (
+        len(parameters) == 2
+        and parameters[0].kind is inspect.Parameter.VAR_POSITIONAL
+        and parameters[1].kind is inspect.Parameter.VAR_KEYWORD
+    )
+
+
+def _validate_provider_schema(name, schema):
+    expected_arguments, expected_returns = _PROVIDER_SCHEMA_TYPES[name]
+    arguments = tuple(getattr(schema, 'arguments', ()))
+    returns = tuple(getattr(schema, 'returns', ()))
+    if len(arguments) < len(expected_arguments):
+        return False
+    for argument, expected_types in zip(arguments, expected_arguments):
+        if getattr(argument, 'kwarg_only', False):
+            return False
+        allowed_types = (
+            (expected_types,) if isinstance(expected_types, str) else expected_types
+        )
+        if str(getattr(argument, 'type', None)) not in allowed_types:
+            return False
+    if len(returns) != len(expected_returns):
+        return False
+    return all(
+        str(getattr(return_value, 'type', None)) == expected_type
+        for return_value, expected_type in zip(returns, expected_returns)
+    )
+
+
+def _validate_provider(name, function):
+    """Validate a provider without mistaking AITER's Torch wrapper for its ABI."""
+
+    expected = _PROVIDER_PARAMETER_NAMES[name]
+    try:
+        signature = inspect.signature(function)
+    except (TypeError, ValueError):
+        signature = None
+
+    if signature is not None and not _is_generic_provider_signature(signature):
+        actual = tuple(signature.parameters)
+        if actual[:len(expected)] != expected:
+            raise RuntimeError(f'HCU mHC provider signature changed: {name}: {actual}')
+        try:
+            signature.bind(*([object()] * len(expected)))
+        except TypeError as error:
+            raise RuntimeError(
+                f'HCU mHC provider call contract changed: {name}: {signature}'
+            ) from error
+        return
+
+    # AITER's torch_compile_guard deliberately exposes (*args, **kwargs). Its
+    # registered torch operator schema is the actual public call contract.
+    schema = _provider_schema(name)
+    if schema is None:
+        actual = tuple(signature.parameters) if signature is not None else None
+        raise RuntimeError(
+            f'HCU mHC provider schema unavailable: {name}: {actual}'
+        )
+    if not _validate_provider_schema(name, schema):
+        raise RuntimeError(
+            f'HCU mHC provider schema changed: {name}: {schema}'
+        )
+
+
 def load_provider():
     try:
         module = import_module('aiter.ops.mhc')
     except ImportError as error:
         logger.warning('HCU_MHC_HIP_UNAVAILABLE: native fallback: %s', error)
         return SimpleNamespace(**{name: None for name in vars(provider)})
-    specs = {
-        'mhc_pre': ('residual', 'fn', 'hc_scale', 'hc_base', 'rms_eps', 'hc_pre_eps',
-                    'hc_sinkhorn_eps', 'hc_post_mult_value', 'sinkhorn_repeat', 'use_tf32'),
-        'mhc_post': ('out', 'x', 'residual', 'post_layer_mix', 'comb_res_mix'),
-        'mhc_pre_gemm_sqrsum': ('out', 'sqrsum', 'x', 'fn', 'tile_k', 'use_tf32'),
-        'mhc_pre_big_fuse': ('post_mix', 'comb_mix', 'layer_input', 'gemm_out_mul',
-                            'gemm_out_sqrsum', 'hc_scale', 'hc_base', 'residual',
-                            'rms_eps', 'hc_pre_eps', 'hc_sinkhorn_eps',
-                            'hc_post_mult_value', 'sinkhorn_repeat'),
-    }
     result = {}
-    for name, parameters in specs.items():
+    for name in _PROVIDER_PARAMETER_NAMES:
         function = getattr(module, name, None)
         if not callable(function):
             result[name] = None
             continue
-        actual = tuple(inspect.signature(function).parameters)
-        if actual[:len(parameters)] != parameters:
-            raise RuntimeError(f'HCU mHC provider signature changed: {name}: {actual}')
-        inspect.signature(function).bind(*([object()] * len(parameters)))
+        _validate_provider(name, function)
         result[name] = function
     return SimpleNamespace(**result)
 
