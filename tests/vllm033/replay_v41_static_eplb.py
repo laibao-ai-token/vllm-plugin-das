@@ -88,7 +88,8 @@ def cfg(width=8, **options):
     return NS(
         model_config=NS(enforce_eager=True, model=MODEL_NAME,
                         hf_config=NS(model_type='deepseek_v41', engram_layer_ids=[],
-                                     vision_n_layers=0, num_hidden_layers=4)),
+                                     vision_n_layers=0, num_hidden_layers=4,
+                                     n_routed_experts=6)),
         parallel_config=NS(prefill_context_parallel_size=width, decode_context_parallel_size=1,
                            pipeline_parallel_size=1, data_parallel_size=1, tensor_parallel_size=1,
                            enable_dbo=False, enable_eplb=False, enable_expert_parallel=True,
@@ -138,6 +139,13 @@ def scope_admission():
     reject(lambda: runtime.validate_config(cfg(width=1)))
     # Speculative decoding is rejected by the owned PCP contract itself.
     x = cfg(); x.speculative_config = NS(method='dspark')
+    reject(lambda: runtime.validate_config(x))
+    # 6 logical + 3 redundant = 9 physical experts, which EP width 8 cannot
+    # divide evenly; this must fail at startup, not at the first proposal.
+    reject(lambda: runtime.validate_config(cfg(num_redundant_experts=3)))
+    assert runtime.validate_config(cfg(num_redundant_experts=10))
+    # Calibration cannot attribute load across DBO ubatches.
+    x = cfg(expert_map_record_path='/tmp/o.json'); x.parallel_config.enable_dbo = True
     reject(lambda: runtime.validate_config(x))
 
 
@@ -298,6 +306,7 @@ class ModelDouble:
         self.num_logical_experts = LOGICAL
         self.num_physical_experts = PHYSICAL
         self.num_redundant_experts = REDUNDANT
+        self.num_expert_groups = 1
         for index, layer in enumerate(self.layers):
             setattr(layer.routed_experts, runtime._ROW_ATTR, plan.layer_map(index))
         setattr(self, runtime._PLAN_ATTR, plan)
@@ -374,11 +383,9 @@ def calibration_allocates_identity():
     assert runtime.bind_placement(NS(), recording) is None
 
 
-def calibration_records_and_proposes():
-    require()
-    record_mod = importlib.import_module('hcu_vllm_das.static_eplb_record')
-    with tempfile.TemporaryDirectory() as directory:
-        output = str(Path(directory) / 'calibrated.json')
+def recording_session(output, *, model=None):
+    """Install (or re-install) calibration routing; returns (model, session)."""
+    if model is None:
         identity = [tuple(range(LOGICAL))] * LAYERS
         model = ModelDouble(NS(layer_map=lambda index: identity[index],
                                physical_to_logical_map=identity,
@@ -387,23 +394,33 @@ def calibration_records_and_proposes():
                                num_redundant_experts=0))
         model.num_physical_experts = LOGICAL
         model.num_redundant_experts = 0
+    with (patch.object(runtime, 'resolve_model_key',
+                       return_value='DeepseekV41LLMForCausalLM'),
+          patch('vllm.model_executor.models.interfaces.get_mixture_of_experts_model',
+                return_value=model)):
+        session = runtime.install_routing(model, cfg(expert_map_record_path=output))
+    return model, session
+
+
+def calibration_records_and_proposes():
+    require()
+    with tempfile.TemporaryDirectory() as directory:
+        output = str(Path(directory) / 'calibrated.json')
+        model, session = recording_session(output)
         options = runtime.read_options(cfg(expert_map_record_path=output))
+        with patch('vllm.model_executor.models.interfaces.get_mixture_of_experts_model',
+                   return_value=model):
+            assert runtime.record_session(model) is session
+        for index, layer in enumerate(model.layers):
+            state = layer.eplb_state
+            # Recording on, identity mapping: routing matches a plain run.
+            assert bool(state.should_record_tensor.item()) is True
+            assert torch.equal(state.logical_to_physical_map.reshape(-1),
+                               torch.arange(LOGICAL, dtype=torch.long))
+            assert state.expert_load_view.shape == (LOGICAL,)
         group = NS(device_group=NS(rank=lambda: 0, size=lambda: EP_SIZE))
         with (patch('vllm.distributed.get_ep_group', return_value=group),
-              patch('vllm.distributed.get_node_count', return_value=1),
-              patch.object(runtime, 'resolve_model_key',
-                           return_value='DeepseekV41LLMForCausalLM'),
-              patch('vllm.model_executor.models.interfaces.get_mixture_of_experts_model',
-                    return_value=model)):
-            session = runtime.install_routing(model, cfg(expert_map_record_path=output))
-            assert runtime.record_session(model) is session
-            for index, layer in enumerate(model.layers):
-                state = layer.eplb_state
-                # Recording on, identity mapping: routing matches a plain run.
-                assert bool(state.should_record_tensor.item()) is True
-                assert torch.equal(state.logical_to_physical_map.reshape(-1),
-                                   torch.arange(LOGICAL, dtype=torch.long))
-                assert state.expert_load_view.shape == (LOGICAL,)
+              patch('vllm.distributed.get_node_count', return_value=1)):
             # No routing observed yet, so no proposal may be written.
             assert session.flush() is None
             assert not Path(output).exists()
@@ -421,6 +438,55 @@ def calibration_records_and_proposes():
         assert plan.source_sha256 == session.last_sha256
         # A hot logical expert is the one worth replicating.
         assert plan.layer_map(0).count(0) > 1
+
+
+def calibration_publishes_token_count():
+    """Core's kernel only records rows below num_unpadded_tokens.
+
+    Left at the zero it is allocated with, every recorded row is filtered out
+    and a calibration run produces nothing at all, silently.
+    """
+    require()
+    with tempfile.TemporaryDirectory() as directory:
+        output = str(Path(directory) / 'calibrated.json')
+        model, session = recording_session(output)
+        unpadded = model.layers[0].eplb_state.num_unpadded_tokens_tensors
+        assert int(unpadded[0].item()) == 0, 'allocated counters start at zero'
+
+        # No padding mask: every row of the batch is a real token.
+        with patch('vllm.forward_context.get_forward_context',
+                   return_value=NS(ubatch_slices=None, is_padding=None)):
+            session.prepare(96)
+        assert int(unpadded[0].item()) == 96
+
+        # With padding, only the real rows may be counted, or a padded batch
+        # would bias the load toward whatever the padding rows route to.
+        padding = torch.zeros(128, dtype=torch.bool)
+        padding[70:] = True
+        with patch('vllm.forward_context.get_forward_context',
+                   return_value=NS(ubatch_slices=None, is_padding=padding)):
+            session.prepare(128)
+        assert int(unpadded[0].item()) == 70
+        # Every layer shares the counter the routers read.
+        for layer in model.layers:
+            assert layer.eplb_state.num_unpadded_tokens_tensors is unpadded
+        # DBO would need per-ubatch counts; refuse rather than mis-attribute.
+        with patch('vllm.forward_context.get_forward_context',
+                   return_value=NS(ubatch_slices=[object()], is_padding=None)):
+            reject(lambda: session.prepare(96))
+
+
+def routing_install_is_idempotent():
+    """The post-load hook can fire twice; re-publishing would drop recorded load."""
+    require()
+    with tempfile.TemporaryDirectory() as directory:
+        output = str(Path(directory) / 'calibrated.json')
+        model, session = recording_session(output)
+        session.load[:, 3] = 11
+        again = recording_session(output, model=model)[1]
+        assert again is session, 'second install must reuse the bound session'
+        assert int(session.load[:, 3].sum().item()) == 11 * LAYERS, \
+            'accumulated load survived re-install'
 
 
 def proposal_rejects_bad_shapes():
@@ -454,6 +520,8 @@ CASES = (
     ('install_routing_requires_binding', install_routing_requires_binding),
     ('calibration_allocates_identity', calibration_allocates_identity),
     ('calibration_records_and_proposes', calibration_records_and_proposes),
+    ('calibration_publishes_token_count', calibration_publishes_token_count),
+    ('routing_install_is_idempotent', routing_install_is_idempotent),
     ('proposal_rejects_bad_shapes', proposal_rejects_bad_shapes),
 )
 

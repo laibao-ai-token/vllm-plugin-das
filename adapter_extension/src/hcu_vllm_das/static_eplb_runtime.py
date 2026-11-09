@@ -34,6 +34,7 @@ _CONFIG_KEY = 'hcu_static_eplb'
 _PLAN_ATTR = '_hcu_static_eplb_plan'
 _ROW_ATTR = '_hcu_static_eplb_row'
 _SESSION_ATTR = '_hcu_static_eplb_record_session'
+_INSTALLED_ATTR = '_hcu_static_eplb_routing_installed'
 _FIELDS = ('expert_map_path', 'expert_map_record_path', 'num_redundant_experts',
            'static_dispatch_policy', 'record_step_interval')
 
@@ -121,6 +122,17 @@ def validate_config(cfg) -> bool:
         errors.append('static EPLB is validated only with deepep_high_throughput')
     if cfg.kernel_config.moe_backend != 'deep_gemm':
         errors.append('static EPLB requires the owned DeepGEMM expert path')
+    if options.recording and p.enable_dbo:
+        errors.append('calibration cannot attribute load across DBO ubatches')
+    # EP width is the flattened TP/PCP width; reject an unusable redundancy here
+    # rather than at the first proposal, which would kill one rank mid-run.
+    ep_size = p.prefill_context_parallel_size * p.tensor_parallel_size
+    physical = cfg.model_config.hf_config.n_routed_experts + options.num_redundant_experts
+    if physical % ep_size:
+        errors.append(
+            f'num_redundant_experts={options.num_redundant_experts} gives '
+            f'{physical} physical experts, which EP width {ep_size} cannot '
+            'divide evenly')
     if errors:
         raise StaticEplbError('HCU static EPLB: ' + '; '.join(errors))
     # The owned PCP target is the only reviewed placement owner; its own
@@ -285,8 +297,18 @@ def bind_placement(model, cfg):
         parameters = []
         expert_storage = {_expert_storage_key(weight)
                           for weight in experts.get_expert_weights()}
+        local_experts = experts.local_num_experts
         for name, parameter in experts.named_parameters():
             if _expert_storage_key(parameter) not in expert_storage:
+                # ``get_expert_weights`` excludes activation scales by name,
+                # assuming they are global. A quantization method that makes
+                # them genuinely per-expert would then keep a native loader and
+                # write logical ids into physical slots; refuse instead.
+                if parameter.dim() and parameter.shape[0] == local_experts:
+                    raise StaticEplbError(
+                        f'static EPLB cannot place expert-indexed parameter '
+                        f'{name!r}: it is absent from get_expert_weights(), so '
+                        'its loader would not follow the placement')
                 continue
             loader = getattr(parameter, 'weight_loader', None)
             if getattr(loader, '__self__', None) is not experts:
@@ -364,6 +386,7 @@ def _install_recording(moe_model, model, cfg, options):
                     record=True)
     session = RecordSession(
         model=moe_model, cfg=cfg, options=options, load=load,
+        unpadded=moe_model.moe_layers[0].eplb_state.num_unpadded_tokens_tensors,
         num_logical=num_logical,
         num_groups=getattr(moe_model, 'num_expert_groups', 1) or 1,
         model_key=resolve_model_key(moe_model),
@@ -390,8 +413,14 @@ def install_routing(model, cfg):
     moe_model = get_mixture_of_experts_model(model)
     if moe_model is None:
         raise StaticEplbError('static EPLB requires a current MixtureOfExperts model')
+    # The post-load hook can run more than once; re-publishing would hand the
+    # routers fresh tensors and discard a calibration run's accumulated load.
+    if getattr(moe_model, _INSTALLED_ATTR, False):
+        return getattr(moe_model, _SESSION_ATTR, None) or getattr(moe_model, _PLAN_ATTR, None)
     if options.recording:
-        return _install_recording(moe_model, model, cfg, options)
+        session = _install_recording(moe_model, model, cfg, options)
+        setattr(moe_model, _INSTALLED_ATTR, True)
+        return session
 
     plan = getattr(moe_model, _PLAN_ATTR, None)
     if not isinstance(plan, StaticEplbPlan):
@@ -407,24 +436,27 @@ def install_routing(model, cfg):
     num_physical = plan.num_physical_experts
     physical_to_logical = plan.physical_to_logical_map.to(device=device)
 
-    # One column per replica of the most replicated logical expert; Core reads
-    # the width from the tensor itself.
+    # Invert the placement without per-slot host syncs: ordering physical slots
+    # by (logical id, slot id) makes each logical expert's replicas contiguous,
+    # so a slot's replica column is its offset from its group's start.
     counts = torch.zeros((num_layers, num_logical), dtype=torch.long, device=device)
-    for layer_idx in range(num_layers):
-        counts[layer_idx].index_add_(
-            0, physical_to_logical[layer_idx],
-            torch.ones(num_physical, dtype=torch.long, device=device))
+    counts.scatter_add_(1, physical_to_logical,
+                        torch.ones_like(physical_to_logical))
     max_replicas = max(1, int(counts.max().item()))
+    order = torch.argsort(physical_to_logical, dim=1, stable=True)
+    sorted_logical = torch.gather(physical_to_logical, 1, order)
+    group_start = torch.cumsum(counts, dim=1) - counts
+    column = (torch.arange(num_physical, device=device).expand(num_layers, -1)
+              - torch.gather(group_start, 1, sorted_logical))
     logical_to_physical = torch.full((num_layers, num_logical, max_replicas), -1,
                                      dtype=torch.long, device=device)
-    filled = torch.zeros((num_layers, num_logical), dtype=torch.long, device=device)
-    for layer_idx in range(num_layers):
-        for physical_id in range(num_physical):
-            logical_id = int(physical_to_logical[layer_idx, physical_id].item())
-            logical_to_physical[layer_idx, logical_id,
-                                int(filled[layer_idx, logical_id].item())] = physical_id
-            filled[layer_idx, logical_id] += 1
-    if not torch.equal(filled, counts):
+    logical_to_physical[
+        torch.arange(num_layers, device=device).unsqueeze(1).expand(-1, num_physical),
+        sorted_logical,
+        column,
+    ] = order
+    # Every logical expert must have exactly the replicas the plan gives it.
+    if not torch.equal((logical_to_physical >= 0).sum(dim=-1), counts):
         raise StaticEplbError('static EPLB replica accounting disagrees with the plan')
 
     group = get_ep_group().device_group
@@ -442,6 +474,7 @@ def install_routing(model, cfg):
                                device=device)
     _publish(moe_model, model, cfg, logical_to_physical=ordered,
              replica_count=primary_count, num_physical=num_physical, record=False)
+    setattr(moe_model, _INSTALLED_ATTR, True)
     return plan
 
 

@@ -117,12 +117,13 @@ class RecordSession:
     counters are cumulative for the whole calibration run and are never zeroed.
     """
 
-    def __init__(self, *, model, cfg, options, load, num_logical, num_groups,
-                 model_key, logger=None):
+    def __init__(self, *, model, cfg, options, load, unpadded, num_logical,
+                 num_groups, model_key, logger=None):
         self.model = model
         self.cfg = cfg
         self.options = options
         self.load = load
+        self.unpadded = unpadded
         self.num_logical = num_logical
         self.num_groups = num_groups
         self.model_key = model_key
@@ -130,6 +131,31 @@ class RecordSession:
         self.writes = 0
         self.last_sha256 = None
         self._logger = logger
+
+    def prepare(self, num_rows: int) -> None:
+        """Publish this forward's real token count before the routers run.
+
+        Core's routing kernel only accumulates rows below
+        ``num_unpadded_tokens``; left at zero it records nothing at all. The
+        vLLM lifecycle refreshes this from ``EplbState.prepare_forward``, which
+        a plugin-owned placement never reaches, so it is filled here instead.
+        Padding rows are excluded so a padded batch cannot bias the counts.
+        """
+        from vllm.forward_context import get_forward_context
+
+        context = get_forward_context()
+        if getattr(context, 'ubatch_slices', None):
+            raise ValueError(
+                'static EPLB calibration does not support DBO/ubatching: '
+                'per-ubatch token ranges would need per-ubatch counters')
+        padding = getattr(context, 'is_padding', None)
+        target = self.unpadded[0]
+        if padding is None:
+            target.fill_(int(num_rows))
+            return
+        # Stay on device: a host sync here would serialize every forward.
+        real = padding[:num_rows].logical_not().sum()
+        target.copy_(real.to(dtype=target.dtype), non_blocking=True)
 
     def step(self) -> None:
         self.steps += 1
@@ -147,7 +173,8 @@ class RecordSession:
             torch.distributed.all_reduce(total, op=torch.distributed.ReduceOp.SUM,
                                          group=group.device_group)
         if int(total.sum().item()) == 0:
-            # Startup profiling and dummy batches carry no routing decisions.
+            # No routed token has been observed yet; a proposal built from an
+            # all-zero load would be an arbitrary permutation, not a placement.
             return None
         device_group = group.device_group
         if device_group.rank() != 0:

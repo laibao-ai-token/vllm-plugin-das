@@ -214,20 +214,34 @@ class HcuV41PcpForCausalLM(native_vl.DeepseekV41ForCausalLM):
         cfg = getattr(self, '_hcu_static_eplb_config', None)
         if cfg is None:
             return super().load_weights(weights)
-        # Bind rows before native loaders read any expert tensor, and publish
-        # routing only once every physical slot has been populated.
+        # Rows must be bound before the native loaders read any expert tensor.
         static_eplb.bind_placement(self, cfg)
-        loaded = super().load_weights(weights)
+        return super().load_weights(weights)
+
+    def process_weights_after_loading(self):
+        super().process_weights_after_loading()
+        cfg = getattr(self, '_hcu_static_eplb_config', None)
+        if cfg is None:
+            return
+        # Every load format reaches this hook, including DummyModelLoader, which
+        # never calls load_weights; routing must be published on all of them or
+        # the routers would start a forward with unset EPLB state.
         static_eplb.install_routing(self, cfg)
         # Only a calibration run has a session; deployment has nothing to step.
         self._hcu_static_eplb_session = static_eplb.record_session(self)
-        return loaded
 
-    def forward(self, *args, **kwargs):
-        output = super().forward(*args, **kwargs)
-        # Calibration counts engine steps here: the load counters themselves are
-        # accumulated by Core's routing kernel, so this adds no device work.
+    def forward(self, input_ids, positions, intermediate_tensors=None,
+                inputs_embeds=None, lookback_token_ids=None, **kwargs):
+        # Calibration publishes this forward's real token count before the
+        # routers run, then counts the step. Core's kernel does the recording,
+        # so neither adds device work beyond one small fill.
         session = getattr(self, '_hcu_static_eplb_session', None)
+        if session is not None:
+            rows = positions.shape[0] if inputs_embeds is None else inputs_embeds.shape[0]
+            session.prepare(rows)
+        output = super().forward(input_ids, positions, intermediate_tensors,
+                                 inputs_embeds,
+                                 lookback_token_ids=lookback_token_ids, **kwargs)
         if session is not None:
             session.step()
         return output
