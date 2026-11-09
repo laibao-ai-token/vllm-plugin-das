@@ -247,6 +247,19 @@ def resolve_model_key(model) -> str:
         f'static EPLB cannot resolve a native map key for {type(model).__name__}')
 
 
+def _real_device(moe_model) -> torch.device:
+    """Device of a tensor the checkpoint loader is guaranteed to have placed.
+
+    ``next(model.parameters()).device`` can return a meta-device placeholder
+    first — e.g. a vision tower left unmaterialized under
+    ``--language-model-only`` — which is a normal-looking Python tensor with
+    no real backing storage. A kernel that reads or writes through it
+    null-dereferences on the device instead of raising a catchable Python
+    exception. Routed expert weights are always materialized by this point.
+    """
+    return moe_model.moe_mlp_layers[0].experts.routed_experts.get_expert_weights()[0].device
+
+
 def _expert_storage_key(weight: torch.Tensor) -> tuple[object, ...]:
     return (weight.untyped_storage(), weight.storage_offset(), weight.numel(),
             weight.dtype)
@@ -340,10 +353,10 @@ def _verify_plan_across_ep_ranks(plan: StaticEplbPlan) -> None:
         raise StaticEplbError('static EPLB plan fingerprint mismatch across EP ranks')
 
 
-def _publish(moe_model, model, cfg, *, logical_to_physical, replica_count,
+def _publish(moe_model, cfg, *, logical_to_physical, replica_count,
              num_physical, record: bool):
     """Hand Core the routing tensors and the recording switch."""
-    device = next(model.parameters()).device
+    device = _real_device(moe_model)
     num_layers = logical_to_physical.shape[0]
     expert_load = torch.zeros((num_layers, num_physical), dtype=torch.int32,
                               device=device)
@@ -363,12 +376,12 @@ def _publish(moe_model, model, cfg, *, logical_to_physical, replica_count,
     return expert_load
 
 
-def _install_recording(moe_model, model, cfg, options):
+def _install_recording(moe_model, cfg, options):
     """Keep the identity placement and switch on Core's load counters."""
     from vllm.logger import init_logger
     from .static_eplb_record import RecordSession
 
-    device = next(model.parameters()).device
+    device = _real_device(moe_model)
     num_layers = moe_model.num_moe_layers
     num_logical = moe_model.num_logical_experts
     if moe_model.num_physical_experts != num_logical:
@@ -380,7 +393,7 @@ def _install_recording(moe_model, model, cfg, options):
         num_layers, -1, -1).contiguous()
     replica_count = torch.ones((num_layers, num_logical), dtype=torch.long,
                                device=device)
-    load = _publish(moe_model, model, cfg,
+    load = _publish(moe_model, cfg,
                     logical_to_physical=logical_to_physical,
                     replica_count=replica_count, num_physical=num_logical,
                     record=True)
@@ -418,7 +431,7 @@ def install_routing(model, cfg):
     if getattr(moe_model, _INSTALLED_ATTR, False):
         return getattr(moe_model, _SESSION_ATTR, None) or getattr(moe_model, _PLAN_ATTR, None)
     if options.recording:
-        session = _install_recording(moe_model, model, cfg, options)
+        session = _install_recording(moe_model, cfg, options)
         setattr(moe_model, _INSTALLED_ATTR, True)
         return session
 
@@ -430,7 +443,7 @@ def install_routing(model, cfg):
         if row != plan.layer_map(index):
             raise StaticEplbError('static EPLB consumer row changed after binding')
 
-    device = next(model.parameters()).device
+    device = _real_device(moe_model)
     num_layers = len(plan.physical_to_logical_map)
     num_logical = plan.num_logical_experts
     num_physical = plan.num_physical_experts
@@ -472,7 +485,7 @@ def install_routing(model, cfg):
     # recording stays off because the placement never changes.
     primary_count = torch.ones((num_layers, num_logical), dtype=torch.long,
                                device=device)
-    _publish(moe_model, model, cfg, logical_to_physical=ordered,
+    _publish(moe_model, cfg, logical_to_physical=ordered,
              replica_count=primary_count, num_physical=num_physical, record=False)
     setattr(moe_model, _INSTALLED_ATTR, True)
     return plan

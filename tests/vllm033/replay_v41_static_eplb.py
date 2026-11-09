@@ -286,7 +286,7 @@ class LayerDouble:
         self.eplb_state = NS(expert_load_view=None, logical_to_physical_map=None,
                              logical_replica_count=None, should_record_tensor=None,
                              num_unpadded_tokens_tensors=None)
-        self.routed_experts = NS()
+        self.routed_experts = NS(get_expert_weights=lambda: [torch.zeros(1)])
 
     def set_eplb_state(self, moe_layer_idx, expert_load_view, logical_to_physical_map,
                        logical_replica_count):
