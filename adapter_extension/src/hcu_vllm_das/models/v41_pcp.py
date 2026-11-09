@@ -219,4 +219,15 @@ class HcuV41PcpForCausalLM(native_vl.DeepseekV41ForCausalLM):
         static_eplb.bind_placement(self, cfg)
         loaded = super().load_weights(weights)
         static_eplb.install_routing(self, cfg)
+        # Only a calibration run has a session; deployment has nothing to step.
+        self._hcu_static_eplb_session = static_eplb.record_session(self)
         return loaded
+
+    def forward(self, *args, **kwargs):
+        output = super().forward(*args, **kwargs)
+        # Calibration counts engine steps here: the load counters themselves are
+        # accumulated by Core's routing kernel, so this adds no device work.
+        session = getattr(self, '_hcu_static_eplb_session', None)
+        if session is not None:
+            session.step()
+        return output

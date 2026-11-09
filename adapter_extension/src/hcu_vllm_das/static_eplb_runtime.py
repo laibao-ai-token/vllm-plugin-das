@@ -33,7 +33,9 @@ from .static_eplb_dispatch import REPLICA_ORDER_BUILDERS
 _CONFIG_KEY = 'hcu_static_eplb'
 _PLAN_ATTR = '_hcu_static_eplb_plan'
 _ROW_ATTR = '_hcu_static_eplb_row'
-_FIELDS = ('expert_map_path', 'num_redundant_experts', 'static_dispatch_policy')
+_SESSION_ATTR = '_hcu_static_eplb_record_session'
+_FIELDS = ('expert_map_path', 'expert_map_record_path', 'num_redundant_experts',
+           'static_dispatch_policy', 'record_step_interval')
 
 
 class StaticEplbError(ValueError):
@@ -42,9 +44,24 @@ class StaticEplbError(ValueError):
 
 @dataclass(frozen=True, slots=True)
 class StaticEplbOptions:
-    expert_map_path: str
+    expert_map_path: str | None
+    expert_map_record_path: str | None
     num_redundant_experts: int
     static_dispatch_policy: str
+    record_step_interval: int
+
+    @property
+    def recording(self) -> bool:
+        return self.expert_map_record_path is not None
+
+
+def _optional_path(payload, name):
+    value = payload.get(name)
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise StaticEplbError(f'{_CONFIG_KEY}.{name} must be a nonempty string')
+    return value
 
 
 def read_options(cfg):
@@ -60,9 +77,12 @@ def read_options(cfg):
     unknown = sorted(set(payload) - set(_FIELDS))
     if unknown:
         raise StaticEplbError(f'unknown {_CONFIG_KEY} fields: {", ".join(unknown)}')
-    path = payload.get('expert_map_path')
-    if not isinstance(path, str) or not path.strip():
-        raise StaticEplbError(f'{_CONFIG_KEY}.expert_map_path must be a nonempty string')
+    path = _optional_path(payload, 'expert_map_path')
+    record_path = _optional_path(payload, 'expert_map_record_path')
+    if (path is None) == (record_path is None):
+        raise StaticEplbError(
+            f'{_CONFIG_KEY} requires exactly one of expert_map_path '
+            '(deploy a placement) or expert_map_record_path (calibrate one)')
     redundant = payload.get('num_redundant_experts', 0)
     if type(redundant) is not int or redundant < 0:
         raise StaticEplbError(
@@ -72,7 +92,11 @@ def read_options(cfg):
         supported = ', '.join(sorted(REPLICA_ORDER_BUILDERS))
         raise StaticEplbError(
             f'{_CONFIG_KEY}.static_dispatch_policy must be one of {supported}')
-    return StaticEplbOptions(path, redundant, policy)
+    interval = payload.get('record_step_interval', 200)
+    if type(interval) is not int or interval < 1:
+        raise StaticEplbError(
+            f'{_CONFIG_KEY}.record_step_interval must be an integer >= 1')
+    return StaticEplbOptions(path, record_path, redundant, policy, interval)
 
 
 def enabled(cfg) -> bool:
@@ -113,6 +137,16 @@ def _backbone_layer(cfg, prefix: str) -> bool:
     return extract_layer_index(prefix) < cfg.model_config.hf_config.num_hidden_layers
 
 
+def _deployed_redundancy(options) -> int:
+    """Redundant slots this process allocates.
+
+    A calibration run keeps the identity placement so routing matches a run
+    without static EPLB; its ``num_redundant_experts`` describes the placement
+    to propose, not the one to allocate now.
+    """
+    return 0 if options.recording else options.num_redundant_experts
+
+
 def moe_eplb_kwargs(cfg, prefix: str) -> dict:
     """Return the Core MoE construction keywords that size physical experts."""
     options = read_options(cfg)
@@ -123,7 +157,7 @@ def moe_eplb_kwargs(cfg, prefix: str) -> dict:
     validate_config(cfg)
     return {
         'enable_eplb': True,
-        'num_redundant_experts': options.num_redundant_experts,
+        'num_redundant_experts': _deployed_redundancy(options),
     }
 
 
@@ -132,21 +166,22 @@ def publish_physical_metadata(moe, cfg, prefix: str) -> None:
     options = read_options(cfg)
     if options is None or not _backbone_layer(cfg, prefix):
         return
+    redundant = _deployed_redundancy(options)
     routed = moe.experts.routed_experts
-    num_physical = moe.n_logical_experts + options.num_redundant_experts
+    num_physical = moe.n_logical_experts + redundant
     num_local = routed.local_num_experts
     ep_size = routed.moe_config.moe_parallel_config.ep_size
     if (routed.moe_config.num_experts != num_physical
             or num_local * ep_size != num_physical):
         raise StaticEplbError(
             f'static EPLB layout mismatch for {moe.prefix}: '
-            f'logical={moe.n_logical_experts} redundant={options.num_redundant_experts} '
+            f'logical={moe.n_logical_experts} redundant={redundant} '
             f'routed_global={routed.moe_config.num_experts} local={num_local} '
             f'ep_size={ep_size}')
     if moe.experts.eplb_state is None:
         raise StaticEplbError(
             f'static EPLB router state was not created for {moe.prefix}')
-    moe.n_redundant_experts = options.num_redundant_experts
+    moe.n_redundant_experts = redundant
     moe.n_physical_experts = num_physical
     moe.n_local_physical_experts = num_local
 
@@ -208,7 +243,9 @@ def _expert_storage_key(weight: torch.Tensor) -> tuple[object, ...]:
 def bind_placement(model, cfg):
     """Attach validated per-layer rows before any checkpoint loader runs."""
     options = read_options(cfg)
-    if options is None:
+    if options is None or options.recording:
+        # Calibration keeps the identity placement, which the native loaders
+        # already produce; nothing may be rebound.
         return None
     validate_config(cfg)
     from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
@@ -281,6 +318,67 @@ def _verify_plan_across_ep_ranks(plan: StaticEplbPlan) -> None:
         raise StaticEplbError('static EPLB plan fingerprint mismatch across EP ranks')
 
 
+def _publish(moe_model, model, cfg, *, logical_to_physical, replica_count,
+             num_physical, record: bool):
+    """Hand Core the routing tensors and the recording switch."""
+    device = next(model.parameters()).device
+    num_layers = logical_to_physical.shape[0]
+    expert_load = torch.zeros((num_layers, num_physical), dtype=torch.int32,
+                              device=device)
+    moe_model.set_eplb_state(expert_load, logical_to_physical, replica_count)
+    should_record = torch.full((), record, dtype=torch.bool, device=device)
+    num_ubatches = max(1, cfg.parallel_config.num_ubatches)
+    unpadded = [torch.tensor(0, dtype=torch.int32, device=device)
+                for _ in range(num_ubatches)]
+    for layer in moe_model.moe_layers:
+        state = layer.eplb_state
+        if state is None:
+            raise StaticEplbError('static EPLB layer is missing its router state')
+        state.should_record_tensor = should_record
+        state.num_unpadded_tokens_tensors = unpadded
+        if state.logical_replica_count is None or state.logical_to_physical_map is None:
+            raise StaticEplbError('static EPLB routing tensors were not published')
+    return expert_load
+
+
+def _install_recording(moe_model, model, cfg, options):
+    """Keep the identity placement and switch on Core's load counters."""
+    from vllm.logger import init_logger
+    from .static_eplb_record import RecordSession
+
+    device = next(model.parameters()).device
+    num_layers = moe_model.num_moe_layers
+    num_logical = moe_model.num_logical_experts
+    if moe_model.num_physical_experts != num_logical:
+        raise StaticEplbError(
+            'static EPLB calibration must run on the identity placement; '
+            f'got {moe_model.num_physical_experts} physical experts')
+    identity = torch.arange(num_logical, dtype=torch.long, device=device)
+    logical_to_physical = identity.reshape(1, num_logical, 1).expand(
+        num_layers, -1, -1).contiguous()
+    replica_count = torch.ones((num_layers, num_logical), dtype=torch.long,
+                               device=device)
+    load = _publish(moe_model, model, cfg,
+                    logical_to_physical=logical_to_physical,
+                    replica_count=replica_count, num_physical=num_logical,
+                    record=True)
+    session = RecordSession(
+        model=moe_model, cfg=cfg, options=options, load=load,
+        num_logical=num_logical,
+        num_groups=getattr(moe_model, 'num_expert_groups', 1) or 1,
+        model_key=resolve_model_key(moe_model),
+        logger=init_logger('vllm.hcu.static_eplb'))
+    setattr(moe_model, _SESSION_ATTR, session)
+    return session
+
+
+def record_session(model):
+    """Return the calibration session bound to a model, if it is recording."""
+    from vllm.model_executor.models.interfaces import get_mixture_of_experts_model
+    moe_model = get_mixture_of_experts_model(model)
+    return getattr(moe_model, _SESSION_ATTR, None) if moe_model is not None else None
+
+
 def install_routing(model, cfg):
     """Publish the fixed routing tensors after checkpoint loading completes."""
     options = read_options(cfg)
@@ -290,6 +388,11 @@ def install_routing(model, cfg):
     from vllm.model_executor.models.interfaces import get_mixture_of_experts_model
 
     moe_model = get_mixture_of_experts_model(model)
+    if moe_model is None:
+        raise StaticEplbError('static EPLB requires a current MixtureOfExperts model')
+    if options.recording:
+        return _install_recording(moe_model, model, cfg, options)
+
     plan = getattr(moe_model, _PLAN_ATTR, None)
     if not isinstance(plan, StaticEplbPlan):
         raise StaticEplbError('static EPLB routing requires a bound placement plan')
@@ -299,7 +402,7 @@ def install_routing(model, cfg):
             raise StaticEplbError('static EPLB consumer row changed after binding')
 
     device = next(model.parameters()).device
-    num_layers = plan_layers = len(plan.physical_to_logical_map)
+    num_layers = len(plan.physical_to_logical_map)
     num_logical = plan.num_logical_experts
     num_physical = plan.num_physical_experts
     physical_to_logical = plan.physical_to_logical_map.to(device=device)
@@ -333,27 +436,13 @@ def install_routing(model, cfg):
         num_physical_experts=num_physical,
     )
     # Every token takes the primary replica in column 0; Core's mapping kernel
-    # reads exactly ``logical_replica_count`` columns per logical expert.
+    # reads exactly ``logical_replica_count`` columns per logical expert, and
+    # recording stays off because the placement never changes.
     primary_count = torch.ones((num_layers, num_logical), dtype=torch.long,
                                device=device)
-    expert_load = torch.zeros((num_layers, num_physical), dtype=torch.int32,
-                              device=device)
-    model_owner = moe_model
-    model_owner.set_eplb_state(expert_load, ordered, primary_count)
-
-    should_record = torch.zeros((), dtype=torch.bool, device=device)
-    num_ubatches = max(1, cfg.parallel_config.num_ubatches)
-    unpadded = [torch.tensor(0, dtype=torch.int32, device=device)
-                for _ in range(num_ubatches)]
-    for layer in moe_model.moe_layers:
-        state = layer.eplb_state
-        if state is None:
-            raise StaticEplbError('static EPLB layer is missing its router state')
-        state.should_record_tensor = should_record
-        state.num_unpadded_tokens_tensors = unpadded
-        if state.logical_replica_count is None or state.logical_to_physical_map is None:
-            raise StaticEplbError('static EPLB routing tensors were not published')
-    return plan, plan_layers
+    _publish(moe_model, model, cfg, logical_to_physical=ordered,
+             replica_count=primary_count, num_physical=num_physical, record=False)
+    return plan
 
 
 __all__ = [
@@ -365,6 +454,7 @@ __all__ = [
     'moe_eplb_kwargs',
     'publish_physical_metadata',
     'read_options',
+    'record_session',
     'resolve_model_key',
     'validate_config',
 ]

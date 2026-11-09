@@ -83,6 +83,8 @@ def load(path, **overrides):
 def cfg(width=8, **options):
     sidecar = dict(expert_map_path='/tmp/eplb_map.json', num_redundant_experts=REDUNDANT)
     sidecar.update(options)
+    if sidecar.get('expert_map_record_path') and 'expert_map_path' not in options:
+        sidecar.pop('expert_map_path')
     return NS(
         model_config=NS(enforce_eager=True, model=MODEL_NAME,
                         hf_config=NS(model_type='deepseek_v41', engram_layer_ids=[],
@@ -104,6 +106,9 @@ def options_parsing():
     require()
     parsed = runtime.read_options(cfg())
     assert parsed.num_redundant_experts == REDUNDANT and parsed.static_dispatch_policy == 'nearest'
+    assert not parsed.recording and parsed.record_step_interval == 200
+    recording = runtime.read_options(cfg(expert_map_record_path='/tmp/out.json'))
+    assert recording.recording and recording.expert_map_path is None
     assert runtime.read_options(NS(additional_config={})) is None
     assert runtime.read_options(NS(additional_config=None)) is None
     assert not runtime.enabled(NS(additional_config={}))
@@ -113,6 +118,10 @@ def options_parsing():
     reject(lambda: runtime.read_options(cfg(num_redundant_experts=-1)))
     reject(lambda: runtime.read_options(cfg(expert_map_path='   ')))
     reject(lambda: runtime.read_options(NS(additional_config={'hcu_static_eplb': 3})))
+    reject(lambda: runtime.read_options(cfg(record_step_interval=0)))
+    # Deploying and calibrating a placement in one run is not a coherent request.
+    both = cfg(); both.additional_config['hcu_static_eplb']['expert_map_record_path'] = '/tmp/o.json'
+    reject(lambda: runtime.read_options(both))
 
 
 def scope_admission():
@@ -354,6 +363,82 @@ def model_key_stays_native():
     reject(lambda: runtime.resolve_model_key(NS()))
 
 
+def calibration_allocates_identity():
+    """A calibration run must perturb nothing: identity placement, 0 redundancy."""
+    require()
+    recording = cfg(expert_map_record_path='/tmp/out.json')
+    keywords = runtime.moe_eplb_kwargs(recording, 'model.layers.2.ffn.experts')
+    # Router state is still required, but no redundant slot is allocated: the
+    # configured redundancy describes the map to propose, not this run.
+    assert keywords == {'enable_eplb': True, 'num_redundant_experts': 0}
+    assert runtime.bind_placement(NS(), recording) is None
+
+
+def calibration_records_and_proposes():
+    require()
+    record_mod = importlib.import_module('hcu_vllm_das.static_eplb_record')
+    with tempfile.TemporaryDirectory() as directory:
+        output = str(Path(directory) / 'calibrated.json')
+        identity = [tuple(range(LOGICAL))] * LAYERS
+        model = ModelDouble(NS(layer_map=lambda index: identity[index],
+                               physical_to_logical_map=identity,
+                               num_logical_experts=LOGICAL,
+                               num_physical_experts=LOGICAL,
+                               num_redundant_experts=0))
+        model.num_physical_experts = LOGICAL
+        model.num_redundant_experts = 0
+        options = runtime.read_options(cfg(expert_map_record_path=output))
+        group = NS(device_group=NS(rank=lambda: 0, size=lambda: EP_SIZE))
+        with (patch('vllm.distributed.get_ep_group', return_value=group),
+              patch('vllm.distributed.get_node_count', return_value=1),
+              patch.object(runtime, 'resolve_model_key',
+                           return_value='DeepseekV41LLMForCausalLM'),
+              patch('vllm.model_executor.models.interfaces.get_mixture_of_experts_model',
+                    return_value=model)):
+            session = runtime.install_routing(model, cfg(expert_map_record_path=output))
+            assert runtime.record_session(model) is session
+            for index, layer in enumerate(model.layers):
+                state = layer.eplb_state
+                # Recording on, identity mapping: routing matches a plain run.
+                assert bool(state.should_record_tensor.item()) is True
+                assert torch.equal(state.logical_to_physical_map.reshape(-1),
+                                   torch.arange(LOGICAL, dtype=torch.long))
+                assert state.expert_load_view.shape == (LOGICAL,)
+            # No routing observed yet, so no proposal may be written.
+            assert session.flush() is None
+            assert not Path(output).exists()
+            # Skew the load so the policy has something to balance.
+            session.load[:, 0] = 4096
+            session.load[:, 1:] = 16
+            for _ in range(options.record_step_interval):
+                session.step()
+            assert session.writes == 1 and Path(output).exists()
+        # The proposal must load back through the deployment path unchanged.
+        plan = load(output, num_redundant_experts=REDUNDANT,
+                    expected_shape=(LAYERS, LOGICAL + REDUNDANT),
+                    model_key='DeepseekV41LLMForCausalLM')
+        assert plan.num_physical_experts == LOGICAL + REDUNDANT
+        assert plan.source_sha256 == session.last_sha256
+        # A hot logical expert is the one worth replicating.
+        assert plan.layer_map(0).count(0) > 1
+
+
+def proposal_rejects_bad_shapes():
+    require()
+    record_mod = importlib.import_module('hcu_vllm_das.static_eplb_record')
+    with tempfile.TemporaryDirectory() as directory:
+        output = Path(directory) / 'bad.json'
+        # A row that drops a logical expert must never reach the file.
+        broken = (tuple([0] * (LOGICAL + REDUNDANT)),) * LAYERS
+        reject(lambda: record_mod.write_offline_map(
+            output, broken, model_key=MODEL_KEY, model_name=MODEL_NAME,
+            num_logical=LOGICAL, num_redundant=REDUNDANT))
+        assert not output.exists()
+        reject(lambda: record_mod.propose_rows(
+            torch.ones(LAYERS, LOGICAL), num_physical=LOGICAL + 1, num_groups=1,
+            num_nodes=1, num_ranks=EP_SIZE))
+
+
 CASES = (
     ('options_parsing', options_parsing),
     ('scope_admission', scope_admission),
@@ -367,6 +452,9 @@ CASES = (
     ('locality_fair_replica_order', locality_fair_replica_order),
     ('install_routing_publishes_primary_only', install_routing_publishes_primary_only),
     ('install_routing_requires_binding', install_routing_requires_binding),
+    ('calibration_allocates_identity', calibration_allocates_identity),
+    ('calibration_records_and_proposes', calibration_records_and_proposes),
+    ('proposal_rejects_bad_shapes', proposal_rejects_bad_shapes),
 )
 
 
