@@ -213,11 +213,12 @@ class _BorrowedEpView:
 
 
 def _load_with_scope(original, target_model, vllm_config):
-    from .quantization.ct_w4a8 import HcuDSV41CTW4A8Config
-    from .dspark_agrs import draft_config
+    from .dspark_agrs import _owned_quant_kind, draft_config
 
     spec = getattr(vllm_config, "speculative_config", None)
-    if not isinstance(getattr(vllm_config, "quant_config", None), HcuDSV41CTW4A8Config):
+    # CT W4A8 and Channel-FP8 both own a private AG-RS draft scope so Graph
+    # capture does not inherit the target's DeepEP LL communicator.
+    if _owned_quant_kind(vllm_config) is None:
         return original(target_model, vllm_config)
     if spec is None or getattr(spec, "method", None) != "dspark":
         return original(target_model, vllm_config)

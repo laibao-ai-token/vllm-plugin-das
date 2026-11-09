@@ -221,7 +221,7 @@ class HcuChannelFP8LLPrepareAndFinalize(DeepEPLLPrepareAndFinalize):
         return hook, receive
 
 
-def make_channel_prepare(moe, quant_config, routing_tables):
+def make_channel_prepare(moe, quant_config, routing_tables, config=None):
     """Use Core's manager/handle factory and reconstruct only the owned owner.
 
     Native constructors retain buffer lifetime and routing-table conversion;
@@ -229,6 +229,12 @@ def make_channel_prepare(moe, quant_config, routing_tables):
     """
     _check_quant_config(quant_config)
     parallel = moe.moe_parallel_config
+    if parallel.all2all_backend == "allgather_reducescatter":
+        from hcu_vllm_das.dspark_agrs import make_channel_draft_prepare
+        from vllm.config import get_current_vllm_config
+
+        cfg = config if config is not None else get_current_vllm_config()
+        return make_channel_draft_prepare(moe, cfg)
     if bool(parallel.use_deepep_ht_kernels) == bool(parallel.use_deepep_ll_kernels):
         raise ChannelFP8PrepareError("Channel-FP8 requires exactly one DeepEP HT/LL route")
     manager = get_ep_all2all_manager()

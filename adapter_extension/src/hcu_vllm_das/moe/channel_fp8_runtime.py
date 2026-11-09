@@ -101,6 +101,11 @@ def validate_packed_layout(weight, packed):
 
 
 def select_channel_backend(parallel, *, requested=None):
+    if getattr(parallel, "all2all_backend", None) == "allgather_reducescatter":
+        # Owned DSpark draft: AG-RS gather + contiguous DeepGEMM, no RocSHMEM.
+        if requested not in (None, "auto", "deep_gemm"):
+            raise ChannelFP8RuntimeError("Channel-FP8 requires the owned deep_gemm backend")
+        return "agrs"
     ht, ll = bool(parallel.use_deepep_ht_kernels), bool(parallel.use_deepep_ll_kernels)
     if ht and ll:
         raise ChannelFP8RuntimeError("DeepEP HT and LL Channel-FP8 routes overlap")
@@ -110,7 +115,7 @@ def select_channel_backend(parallel, *, requested=None):
         return "ht"
     if ll:
         return "ll"
-    raise ChannelFP8RuntimeError("Channel-FP8 DeepGEMM requires DeepEP HT or LL")
+    raise ChannelFP8RuntimeError("Channel-FP8 DeepGEMM requires DeepEP HT/LL or owned AG-RS")
 
 
 def deepgemm_contiguous(*args, **kwargs):
@@ -177,6 +182,9 @@ class ChannelFP8ContiguousExperts(mk.FusedMoEExpertsModular):
 
     @staticmethod
     def _supports_parallel_config(parallel):
+        # DeepEP HT target, or owned DSpark AG-RS draft (neither HT nor LL flags).
+        if getattr(parallel, "all2all_backend", None) == "allgather_reducescatter":
+            return bool(getattr(parallel, "use_ep", True))
         return parallel.use_deepep_ht_kernels and not parallel.use_deepep_ll_kernels
 
     def supports_expert_map(self):
@@ -201,13 +209,21 @@ class ChannelFP8ContiguousExperts(mk.FusedMoEExpertsModular):
     def apply(self, output, hidden_states, w1, w2, topk_weights, topk_ids, activation, global_num_experts, expert_map, a1q_scale, a2_scale, workspace13, workspace2, expert_tokens_meta, apply_router_weight_on_input):
         e, m, two_n, k, topk = self.moe_problem_size(hidden_states, w1, w2, topk_ids)
         if activation != MoEActivation.SILU or hidden_states.dtype != torch.float8_e4m3fn:
-            raise ChannelFP8RuntimeError("Channel-FP8 HT requires SiLU and FP8 input")
+            raise ChannelFP8RuntimeError("Channel-FP8 contiguous experts require SiLU and FP8 input")
         scale = _token_scale(a1q_scale, (m, 1))
         if m == 0:
             return
+        # DeepEP HT supplies counts; owned AG-RS draft does not — mirror CT and
+        # derive local expert occupancy from topk_ids + expert_map.
         counts = getattr(expert_tokens_meta, "expert_num_tokens", None)
         if counts is None:
-            raise ChannelFP8RuntimeError("Channel-FP8 HT requires expert token metadata")
+            from vllm.model_executor.layers.fused_moe.utils import count_expert_num_tokens
+
+            counts = count_expert_num_tokens(topk_ids, e, expert_map)
+        if counts.dtype != torch.int32:
+            counts = counts.to(torch.int32)
+        if not counts.is_contiguous():
+            counts = counts.contiguous()
         aligned = compute_aligned_M(M=m, num_topk=topk, local_num_experts=e, alignment=self.ALIGNMENT, expert_tokens_meta=expert_tokens_meta)
         q = _resize_cache(workspace13.view(dtype=hidden_states.dtype), (aligned, k))
         scales = torch.zeros((aligned, 1), dtype=torch.float32, device=q.device)

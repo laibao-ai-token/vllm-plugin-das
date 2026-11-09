@@ -75,12 +75,32 @@ def is_owned_draft(cfg):
     return isinstance(metadata, dict) and metadata.get('owner') == _OWNER
 
 
+def _owned_quant_kind(cfg):
+    from .quantization.ct_w4a8 import HcuDSV41CTW4A8Config
+    from .quantization.dsv41_channel_fp8 import HcuDSV41ChannelFP8Config
+
+    if isinstance(cfg.quant_config, HcuDSV41CTW4A8Config):
+        return "ct_w4a8"
+    if isinstance(cfg.quant_config, HcuDSV41ChannelFP8Config):
+        return "channel_fp8"
+    return None
+
+
 def draft_config(cfg):
     """Copy only construction policy, retaining native live registration tables."""
-    from .quantization.ct_w4a8 import HcuDSV41CTW4A8Config
+    # Graph loader may call draft_config, then re-enter model construction with
+    # the already-owned AG-RS copy. Stay idempotent instead of re-checking the
+    # target's DeepEP LL topology against the private backend.
+    if is_owned_draft(cfg):
+        if token_capacity(cfg) != _capacity_from_metadata(cfg):
+            raise RuntimeError("DSpark token capacity changed after construction")
+        return cfg
     p, spec = cfg.parallel_config, cfg.speculative_config
-    if not isinstance(cfg.quant_config, HcuDSV41CTW4A8Config):
-        raise ValueError('owned draft AG-RS requires the HCU CT W4A8 config')
+    kind = _owned_quant_kind(cfg)
+    if kind is None:
+        raise ValueError(
+            "owned draft AG-RS requires HCU CT W4A8 or Channel-FP8 quantization"
+        )
     if spec is None or spec.method != 'dspark' or spec.draft_model_config.hf_config.model_type not in ('deepseek_v41', 'deepseek_v41_text'):
         raise ValueError('owned draft AG-RS requires native V41 DSpark')
     if any(getattr(p, name) != 1 for name in ('tensor_parallel_size', 'pipeline_parallel_size', 'prefill_context_parallel_size', 'decode_context_parallel_size')):
@@ -103,18 +123,21 @@ def draft_config(cfg):
         validate_graph_capacity(cfg)
         token_capacity(cfg)
     if cfg.kernel_config.moe_backend != 'deep_gemm':
-        raise ValueError('DSpark CT W4A8 requires the owned DeepGEMM expert path')
+        raise ValueError('DSpark AG-RS requires the owned DeepGEMM expert path')
     capacity = token_capacity(cfg)
     result = copy.copy(cfg)
     result.parallel_config = copy.copy(p)
     result.parallel_config.all2all_backend = _BACKEND
-    extra = getattr(cfg, 'additional_config', None)
-    if not isinstance(extra, dict):
-        raise ValueError('DSpark AG-RS requires a dict additional_config owner store')
+    extra = getattr(cfg, "additional_config", None)
+    if extra is None:
+        extra = {}
+    elif not isinstance(extra, dict):
+        raise ValueError("DSpark AG-RS requires a dict additional_config owner store")
     result.additional_config = dict(extra)
     result.additional_config[_META_KEY] = {
         'owner': _OWNER,
         'capacity': _capacity_tuple(capacity),
+        'quant': kind,
     }
     return result
 
@@ -219,13 +242,105 @@ class HcuCTAgRsPrepareAndFinalize(MoEPrepareAndFinalizeNaiveDPEPModular):
         return q, scales, meta, ids, weights
 
 
-def make_draft_prepare(moe, cfg):
+def _make_owned_manager(moe, cfg):
     if not is_owned_draft(cfg):
-        raise ValueError('AG-RS CT preparation requires owned DSpark construction')
+        raise ValueError("AG-RS preparation requires owned DSpark construction")
     if token_capacity(cfg) != _capacity_from_metadata(cfg):
-        raise RuntimeError('DSpark token capacity changed after construction')
+        raise RuntimeError("DSpark token capacity changed after construction")
     manager = HcuDSparkAgRsManager(moe.max_num_tokens)
     actual = moe.moe_parallel_config
-    if actual.ep_size != manager.world_size or actual.dp_size != manager.dp_world_size or actual.ep_rank != manager.rank:
-        raise RuntimeError('DSpark MoE membership differs from borrowed AG-RS groups')
-    return HcuCTAgRsPrepareAndFinalize(manager)
+    if (
+        actual.ep_size != manager.world_size
+        or actual.dp_size != manager.dp_world_size
+        or actual.ep_rank != manager.rank
+    ):
+        raise RuntimeError("DSpark MoE membership differs from borrowed AG-RS groups")
+    return manager
+
+
+def make_draft_prepare(moe, cfg):
+    return HcuCTAgRsPrepareAndFinalize(_make_owned_manager(moe, cfg))
+
+
+class HcuChannelFP8AgRsPrepareAndFinalize(MoEPrepareAndFinalizeNaiveDPEPModular):
+    """Channel-FP8 draft AG-RS: gather BF16, then owned per-token FP8 quant."""
+
+    def __init__(self, manager):
+        super().__init__(is_sequence_parallel=False, num_dispatchers=manager.world_size)
+        self.manager = manager
+        self._native_prepare = _bind(self, "prepare", manager)
+        self.finalize = _bind(self, "finalize", manager)
+        self._allocate_combine_input = _bind(self, "_allocate_combine_input", manager)
+
+    def prepare(
+        self,
+        a1,
+        topk_weights,
+        topk_ids,
+        num_experts,
+        expert_map,
+        apply_router_weight_on_input,
+        quant_config,
+        defer_input_quant=False,
+    ):
+        self.manager.check_health()
+        if (
+            defer_input_quant
+            or quant_config.quant_dtype != torch.float8_e4m3fn
+            or not quant_config.per_act_token_quant
+            or quant_config.block_shape is not None
+            or quant_config.is_scale_swizzled
+        ):
+            raise ValueError(
+                "DSpark Channel-FP8 AG-RS requires owned dynamic token FP8"
+            )
+        if (
+            a1.ndim != 2
+            or a1.dtype != torch.bfloat16
+            or a1.shape[0] > self.manager._capacity
+            or topk_ids.shape != topk_weights.shape
+            or topk_ids.ndim != 2
+            or topk_ids.shape[0] != a1.shape[0]
+            or topk_ids.dtype not in (torch.int32, torch.int64)
+            or topk_weights.dtype != torch.float32
+        ):
+            raise ValueError(
+                "DSpark Channel-FP8 AG-RS local input/routes violate the wire contract"
+            )
+        x, _, meta, ids, weights = self._native_prepare(
+            a1,
+            topk_weights,
+            topk_ids,
+            num_experts,
+            expert_map,
+            apply_router_weight_on_input,
+            quant_config,
+            defer_input_quant=True,
+        )
+        if not x.shape[0]:
+            q = x.to(torch.float8_e4m3fn)
+            scales = x.new_empty((0, 1), dtype=torch.float32)
+        else:
+            q, scales = moe_kernel_quantize_input(
+                x,
+                None,
+                quant_dtype=torch.float8_e4m3fn,
+                per_act_token_quant=True,
+                block_shape=None,
+            )
+        if scales.ndim == 1:
+            scales = scales.unsqueeze(-1)
+        if (
+            q.dtype != torch.float8_e4m3fn
+            or scales.dtype != torch.float32
+            or scales.device != q.device
+            or scales.shape != (q.shape[0], 1)
+        ):
+            raise RuntimeError(
+                "DSpark Channel-FP8 AG-RS did not produce per-token FP8 scales"
+            )
+        return q, scales, meta, ids, weights
+
+
+def make_channel_draft_prepare(moe, cfg):
+    return HcuChannelFP8AgRsPrepareAndFinalize(_make_owned_manager(moe, cfg))
