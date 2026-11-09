@@ -71,12 +71,39 @@ _BACKBONE_INIT = _constructor(_BACKBONE_NATIVE, _REVIEWED[1],
                               {'DeepseekV4DecoderLayer': HcuV41PcpDecoderLayer})
 
 
+_REPLAY_NATIVE = native.DeepseekV4Model._decoder_replay_supported
+_REPLAY_REVIEWED = '1e54ff54d365b98ece53fc86c8893e7787ae75143a8269c55b4813d6f9952a96'
+if hashlib.sha256(inspect.getsource(_REPLAY_NATIVE).encode()).hexdigest() != _REPLAY_REVIEWED:
+    raise RuntimeError('HCU V41 PCP decoder replay gate source changed: '
+                       f'{_REPLAY_NATIVE.__qualname__}')
+
+
 class HcuV41PcpBackbone(native.DeepseekV4Model):
     def __init__(self, *, vllm_config, prefix=''):
         if validate_config(vllm_config):
             _BACKBONE_INIT(self, vllm_config=vllm_config, prefix=prefix)
         else:
             super().__init__(vllm_config=vllm_config, prefix=prefix)
+
+    def _decoder_replay_supported(self, vllm_config, cut):
+        """Native gate minus its PCP refusal, for the owned PCP model only.
+
+        Native model state pads each rank's replay batch to the global kept
+        rows and rebuilds PCP metadata for it; owned PCP attention reads only
+        that metadata. validate_config already pins PP/DP=1 and no drafter.
+        """
+        if not validate_config(vllm_config):
+            return _REPLAY_NATIVE(self, vllm_config, cut)
+        if self.start_layer > cut or self.end_layer < self.config.num_hidden_layers:
+            reason = 'the pipeline stage must hold the last KV source and every later layer'
+        elif self.use_sequence_parallel or vllm_config.parallel_config.use_ubatching:
+            reason = 'sequence parallel and microbatching cannot follow the replay batch'
+        elif any(i >= cut for i in getattr(self.config, 'engram_layer_ids', ())):
+            reason = 'an Engram layer sits at or after the last KV source layer'
+        else:
+            return True
+        native.logger.warning_once('Decoder SWA bounded replay is off: %s.', reason)
+        return False
 
 
 class HcuV41PcpLLM(native.DeepseekV41LLMForCausalLM):
