@@ -35,6 +35,7 @@ _PLAN_ATTR = '_hcu_static_eplb_plan'
 _ROW_ATTR = '_hcu_static_eplb_row'
 _SESSION_ATTR = '_hcu_static_eplb_record_session'
 _INSTALLED_ATTR = '_hcu_static_eplb_routing_installed'
+_LOADERS_BOUND_ATTR = '_hcu_static_eplb_loaders_bound'
 _FIELDS = ('expert_map_path', 'expert_map_record_path', 'num_redundant_experts',
            'static_dispatch_policy', 'record_step_interval')
 
@@ -265,8 +266,12 @@ def _expert_storage_key(weight: torch.Tensor) -> tuple[object, ...]:
             weight.dtype)
 
 
-def bind_placement(model, cfg):
-    """Attach validated per-layer rows before any checkpoint loader runs."""
+def bind_placement(model, cfg, *, bind_weight_loaders=True):
+    """Bind layout rows, and optionally the checkpoint weight fan-out loaders.
+
+    Dummy loading initializes physical tensors directly. Its post-load hook
+    needs the same validated rows without inspecting already-packed loaders.
+    """
     options = read_options(cfg)
     if options is None or options.recording:
         # Calibration keeps the identity placement, which the native loaders
@@ -281,7 +286,9 @@ def bind_placement(model, cfg):
     if moe_model is None:
         raise StaticEplbError('static EPLB requires a current MixtureOfExperts model')
     bound = getattr(moe_model, _PLAN_ATTR, None)
-    if bound is not None:
+    if bound is not None and (
+        not bind_weight_loaders or getattr(moe_model, _LOADERS_BOUND_ATTR, False)
+    ):
         return bound
 
     layers = tuple(moe_model.moe_mlp_layers)
@@ -290,7 +297,7 @@ def bind_placement(model, cfg):
     if moe_model.num_redundant_experts != options.num_redundant_experts:
         raise StaticEplbError(
             'static EPLB redundant expert count was not published by MoE construction')
-    plan = load_static_eplb_plan(
+    plan = bound if bound is not None else load_static_eplb_plan(
         options.expert_map_path,
         model_key=resolve_model_key(moe_model),
         expected_model_name=cfg.model_config.model,
@@ -308,6 +315,9 @@ def bind_placement(model, cfg):
                 or experts.moe_config.num_experts != plan.num_physical_experts):
             raise StaticEplbError('static EPLB RoutedExperts count mismatch')
         parameters = []
+        if not bind_weight_loaders:
+            targets.append((experts, parameters))
+            continue
         expert_storage = {_expert_storage_key(weight)
                           for weight in experts.get_expert_weights()}
         local_experts = experts.local_num_experts
@@ -336,6 +346,8 @@ def bind_placement(model, cfg):
         for parameter, original in parameters:
             parameter.weight_loader = MethodType(_static_loader(original), experts)
     setattr(moe_model, _PLAN_ATTR, plan)
+    if bind_weight_loaders:
+        setattr(moe_model, _LOADERS_BOUND_ATTR, True)
     return plan
 
 

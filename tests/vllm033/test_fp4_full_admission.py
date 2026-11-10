@@ -37,10 +37,18 @@ def optin(monkeypatch):
 
 
 def test_off_preserves_default_fp8(monkeypatch):
-    monkeypatch.delenv('HCU_VLLM_FP4_INDEXER_IMPL', raising=False)
+    monkeypatch.setenv('HCU_VLLM_FP4_INDEXER_IMPL', 'stock')
     monkeypatch.delenv('HCU_DISABLE_OPS', raising=False)
     assert not selected()
     assert validate_config(config()) is None
+
+
+def test_fp4_model_rejects_static_eplb_before_construction(optin):
+    from hcu_vllm_das.models.v41_pcp import HcuV41PcpForCausalLM
+    optin.additional_config = {'hcu_static_eplb': {'expert_map_path': '/tmp/map.json'}}
+    model = HcuV41PcpForCausalLM.__new__(HcuV41PcpForCausalLM)
+    with pytest.raises(ValueError, match='static EPLB cannot compose'):
+        HcuV41PcpForCausalLM.__init__(model, vllm_config=optin)
 
 
 def test_config_file_optin_uses_real_resolver(monkeypatch):

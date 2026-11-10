@@ -200,7 +200,7 @@ _EPLB_BACKBONE_INIT = _constructor(_BACKBONE_NATIVE, _REVIEWED[1],
                                     {'DeepseekV4DecoderLayer': HcuV41EplbDecoderLayer})
 
 
-class HcuV41EplbBackbone(native.DeepseekV4Model):
+class HcuV41EplbBackbone(HcuV41PcpBackbone):
     def __init__(self, *, vllm_config, prefix=''):
         _EPLB_BACKBONE_INIT(self, vllm_config=vllm_config, prefix=prefix)
 
@@ -217,6 +217,9 @@ class HcuV41PcpForCausalLM(native_vl.DeepseekV41ForCausalLM):
     def __init__(self, *, vllm_config, prefix=''):
         from hcu_adapter.fp4_indexer import selected as fp4_selected
         if fp4_selected():
+            if static_eplb.enabled(vllm_config):
+                raise static_eplb.StaticEplbError(
+                    'static EPLB cannot compose with the PCP1 FP4 model')
             from ..fp4_indexer import preflight
             preflight(vllm_config)
             from ..v41_pcp_activation import check_health
@@ -262,6 +265,7 @@ class HcuV41PcpForCausalLM(native_vl.DeepseekV41ForCausalLM):
         # Every load format reaches this hook, including DummyModelLoader, which
         # never calls load_weights; routing must be published on all of them or
         # the routers would start a forward with unset EPLB state.
+        static_eplb.bind_placement(self, cfg, bind_weight_loaders=False)
         static_eplb.install_routing(self, cfg)
         # Only a calibration run has a session; deployment has nothing to step.
         self._hcu_static_eplb_session = static_eplb.record_session(self)
@@ -272,13 +276,14 @@ class HcuV41PcpForCausalLM(native_vl.DeepseekV41ForCausalLM):
         # routers run, then counts the step. Core's kernel does the recording,
         # so neither adds device work beyond one small fill.
         session = getattr(self, '_hcu_static_eplb_session', None)
+        record_step = False
         if session is not None:
             rows = positions.shape[0] if inputs_embeds is None else inputs_embeds.shape[0]
-            session.prepare(rows)
+            record_step = session.prepare(rows)
         output = super().forward(input_ids, positions, intermediate_tensors,
                                  inputs_embeds,
                                  lookback_token_ids=lookback_token_ids, **kwargs)
-        if session is not None:
+        if record_step:
             session.step()
         return output
 

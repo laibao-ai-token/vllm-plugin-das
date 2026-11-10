@@ -132,30 +132,37 @@ class RecordSession:
         self.last_sha256 = None
         self._logger = logger
 
-    def prepare(self, num_rows: int) -> None:
+    def prepare(self, num_rows: int) -> bool:
         """Publish this forward's real token count before the routers run.
 
         Core's routing kernel only accumulates rows below
         ``num_unpadded_tokens``; left at zero it records nothing at all. The
         vLLM lifecycle refreshes this from ``EplbState.prepare_forward``, which
         a plugin-owned placement never reaches, so it is filled here instead.
-        Padding rows are excluded so a padded batch cannot bias the counts.
+        Padding rows and memory-profile forwards are excluded. Return whether
+        this forward can advance the calibration interval.
         """
         from vllm.forward_context import get_forward_context
 
         context = get_forward_context()
+        target = self.unpadded[0]
+        # Core profiles MoE with non-padding dummy tokens before KV caches and
+        # attention metadata exist. Those rows must never enter the counters.
+        if context.attn_metadata is None or num_rows == 0:
+            target.zero_()
+            return False
         if getattr(context, 'ubatch_slices', None):
             raise ValueError(
                 'static EPLB calibration does not support DBO/ubatching: '
                 'per-ubatch token ranges would need per-ubatch counters')
         padding = getattr(context, 'is_padding', None)
-        target = self.unpadded[0]
         if padding is None:
             target.fill_(int(num_rows))
-            return
+            return True
         # Stay on device: a host sync here would serialize every forward.
         real = padding[:num_rows].logical_not().sum()
         target.copy_(real.to(dtype=target.dtype), non_blocking=True)
+        return True
 
     def step(self) -> None:
         self.steps += 1

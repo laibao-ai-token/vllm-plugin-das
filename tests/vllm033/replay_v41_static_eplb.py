@@ -137,7 +137,7 @@ def scope_admission():
     reject(lambda: runtime.validate_config(x))
     # PCP1 is not the owned target ladder, so static placement has no owner.
     reject(lambda: runtime.validate_config(cfg(width=1)))
-    # Speculative decoding is rejected by the owned PCP contract itself.
+    # An incomplete DSpark configuration is rejected before construction.
     x = cfg(); x.speculative_config = NS(method='dspark')
     reject(lambda: runtime.validate_config(x))
     # 6 logical + 3 redundant = 9 physical experts, which EP width 8 cannot
@@ -455,7 +455,7 @@ def calibration_publishes_token_count():
 
         # No padding mask: every row of the batch is a real token.
         with patch('vllm.forward_context.get_forward_context',
-                   return_value=NS(ubatch_slices=None, is_padding=None)):
+                   return_value=NS(attn_metadata={}, ubatch_slices=None, is_padding=None)):
             session.prepare(96)
         assert int(unpadded[0].item()) == 96
 
@@ -464,7 +464,7 @@ def calibration_publishes_token_count():
         padding = torch.zeros(128, dtype=torch.bool)
         padding[70:] = True
         with patch('vllm.forward_context.get_forward_context',
-                   return_value=NS(ubatch_slices=None, is_padding=padding)):
+                   return_value=NS(attn_metadata={}, ubatch_slices=None, is_padding=padding)):
             session.prepare(128)
         assert int(unpadded[0].item()) == 70
         # Every layer shares the counter the routers read.
@@ -472,7 +472,7 @@ def calibration_publishes_token_count():
             assert layer.eplb_state.num_unpadded_tokens_tensors is unpadded
         # DBO would need per-ubatch counts; refuse rather than mis-attribute.
         with patch('vllm.forward_context.get_forward_context',
-                   return_value=NS(ubatch_slices=[object()], is_padding=None)):
+                   return_value=NS(attn_metadata={}, ubatch_slices=[object()], is_padding=None)):
             reject(lambda: session.prepare(96))
 
 
@@ -505,6 +505,103 @@ def proposal_rejects_bad_shapes():
             num_nodes=1, num_ranks=EP_SIZE))
 
 
+def calibration_excludes_startup_forwards():
+    """The actual model wrapper records real requests after dummy startup."""
+    require()
+    models = importlib.import_module('hcu_vllm_das.models.v41_pcp')
+    with tempfile.TemporaryDirectory() as directory:
+        output = str(Path(directory) / 'calibrated.json')
+        _, session = recording_session(output)
+        outer = models.HcuV41PcpForCausalLM.__new__(models.HcuV41PcpForCausalLM)
+        torch.nn.Module.__init__(outer)
+        outer._hcu_static_eplb_session = session
+
+        def router_double(self, input_ids, positions, *args, **kwargs):
+            # The GPU router records only rows below the published counter.
+            session.load[:, 0] += int(session.unpadded[0].item())
+            return positions
+
+        group = NS(device_group=NS(rank=lambda: 0, size=lambda: EP_SIZE))
+        with (patch.object(models.native_vl.DeepseekV41ForCausalLM,
+                           'forward', router_double),
+              patch('vllm.distributed.get_ep_group', return_value=group),
+              patch('vllm.distributed.get_node_count', return_value=1)):
+            inputs = torch.zeros(8, dtype=torch.long)
+            positions = torch.arange(8)
+            profile = NS(attn_metadata=None, ubatch_slices=None,
+                         is_padding=torch.zeros(8, dtype=torch.bool))
+            with patch('vllm.forward_context.get_forward_context', return_value=profile):
+                outer.forward(inputs, positions)
+            assert session.steps == 0 and session.load.sum().item() == 0
+            assert session.flush() is None and not Path(output).exists()
+
+            warmup = NS(attn_metadata={}, ubatch_slices=None,
+                        is_padding=torch.ones(8, dtype=torch.bool))
+            with patch('vllm.forward_context.get_forward_context', return_value=warmup):
+                outer.forward(inputs, positions)
+            assert session.load.sum().item() == 0
+            assert session.flush() is None and not Path(output).exists()
+
+            request = NS(attn_metadata={}, ubatch_slices=None,
+                         is_padding=torch.tensor([False] * 6 + [True] * 2))
+            with patch('vllm.forward_context.get_forward_context', return_value=request):
+                outer.forward(inputs, positions)
+            assert int(session.unpadded[0].item()) == 6
+            assert int(session.load.sum().item()) == 6 * LAYERS
+            # A later profile must preserve, and add nothing to, real load.
+            steps = session.steps
+            with patch('vllm.forward_context.get_forward_context', return_value=profile):
+                outer.forward(inputs, positions)
+            assert session.steps == steps
+            assert int(session.load.sum().item()) == 6 * LAYERS
+            assert session.flush() is not None and Path(output).exists()
+
+
+def dummy_deployment_binds_before_routing():
+    """Post-load must work even when model.load_weights was never called."""
+    require()
+    models = importlib.import_module('hcu_vllm_das.models.v41_pcp')
+    with tempfile.TemporaryDirectory() as directory:
+        path = write_map(directory)
+        model = ModelDouble(load(path))
+        delattr(model, runtime._PLAN_ATTR)
+        for layer in model.layers:
+            experts = layer.routed_experts
+            delattr(experts, runtime._ROW_ATTR)
+            experts.moe_config = NS(num_logical_experts=LOGICAL, num_experts=PHYSICAL)
+            experts.local_num_experts = PHYSICAL // EP_SIZE
+            # Quantization can replace parameters with packed tensors that
+            # have no checkpoint loader. Binding layout must leave those alone.
+            weight = torch.nn.Parameter(torch.zeros(PHYSICAL // EP_SIZE, 2))
+            experts.get_expert_weights = lambda weight=weight: [weight]
+            experts.named_parameters = lambda weight=weight: [('packed_weight', weight)]
+        config = cfg(width=EP_SIZE, expert_map_path=path)
+        config.model_config.hf_config.n_routed_experts = LOGICAL
+        outer = models.HcuV41PcpForCausalLM.__new__(models.HcuV41PcpForCausalLM)
+        torch.nn.Module.__init__(outer)
+        outer._hcu_static_eplb_config = config
+        group = NS(device_group=NS(rank=lambda: 1, size=lambda: EP_SIZE))
+        with (patch.object(models.native_vl.DeepseekV41ForCausalLM,
+                           'process_weights_after_loading', lambda self: None),
+              patch('vllm.model_executor.models.interfaces.get_mixture_of_experts_model',
+                    return_value=model),
+              patch('vllm.model_executor.layers.fused_moe.routed_experts.RoutedExperts', NS),
+              patch.object(runtime, 'resolve_model_key', return_value=MODEL_KEY),
+              patch('vllm.distributed.get_ep_group', return_value=group),
+              patch('vllm.distributed.get_node_count', return_value=1)):
+            outer.process_weights_after_loading()
+            plan = getattr(model, runtime._PLAN_ATTR)
+            outer.process_weights_after_loading()
+            assert getattr(model, runtime._PLAN_ATTR) is plan
+        assert outer._hcu_static_eplb_session is None
+        for index, layer in enumerate(model.layers):
+            assert getattr(layer.routed_experts, runtime._ROW_ATTR) == tuple(ROWS[index])
+            assert layer.eplb_state.logical_to_physical_map is not None
+            assert not hasattr(layer.routed_experts.get_expert_weights()[0], 'weight_loader')
+        assert models.HcuV41EplbBackbone._decoder_replay_supported is (
+            models.HcuV41PcpBackbone._decoder_replay_supported)
+
+
 CASES = (
     ('options_parsing', options_parsing),
     ('scope_admission', scope_admission),
@@ -523,6 +620,8 @@ CASES = (
     ('calibration_publishes_token_count', calibration_publishes_token_count),
     ('routing_install_is_idempotent', routing_install_is_idempotent),
     ('proposal_rejects_bad_shapes', proposal_rejects_bad_shapes),
+    ('calibration_excludes_startup_forwards', calibration_excludes_startup_forwards),
+    ('dummy_deployment_binds_before_routing', dummy_deployment_binds_before_routing),
 )
 
 
