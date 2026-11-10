@@ -241,6 +241,29 @@ def health():
         rejects(lambda:activation.activate_extension(CONTEXT),ExtensionCommitError)
 
 
+def graph_registration_timing():
+    require()
+    with ExitStack() as stack:
+        cfg=setup(stack)
+        from vllm.config import CompilationMode, CUDAGraphMode
+        from hcu_vllm_das.v41_indexer_graph import OP_NAME
+        # Activation happens before the resolved VllmConfig exists.  The
+        # construction path must perform the split registration instead.
+        assert not hasattr(cfg, 'compilation_config')
+        cfg.compilation_config=SimpleNamespace(
+            mode=CompilationMode.VLLM_COMPILE,
+            cudagraph_mode=CUDAGraphMode.PIECEWISE,
+            use_inductor_graph_partition=False,
+            splitting_ops=[],
+        )
+        cfg.model_config.enforce_eager=False
+        cache,_,_=pack(1);out=torch.zeros(2,8,dtype=torch.int32)
+        obj(cache,out)
+        assert cfg.compilation_config.splitting_ops==[OP_NAME]
+        obj(cache,out)
+        assert cfg.compilation_config.splitting_ops==[OP_NAME]
+
+
 def main():
     parser=argparse.ArgumentParser();parser.add_argument('output',type=Path);args=parser.parse_args()
     torch.set_num_threads(1)
@@ -250,6 +273,7 @@ def main():
     case('native_prefill_chunk_contract_and_short_row_order',prefill)
     case('masked_topk_construction_admission_and_other_paths_native',topk_and_native)
     case('registration_idempotence_policy_and_owner_health',health)
+    case('splitting_registration_at_post_activation_construction',graph_registration_timing)
     assert original is native.SparseAttnIndexer.forward_hip and not torch.cuda.is_initialized()
     root=Path(__file__).resolve().parents[2];sha=lambda p:subprocess.check_output(['git','-C',str(p),'rev-parse','HEAD'],text=True).strip()
     sources={str(p.relative_to(root)):hashlib.sha256(p.read_bytes()).hexdigest() for p in (root/'adapter_extension/src/hcu_vllm_das').glob('v41_indexer*.py')}

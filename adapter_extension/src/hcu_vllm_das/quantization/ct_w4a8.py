@@ -37,13 +37,18 @@ def validate_topology(config, moe):
     if any(type(v) is not int or v <= 0 for v in (p.data_parallel_size,p.prefill_context_parallel_size,moe.max_num_tokens)):
         errors.append('parallel widths/capacity must be positive integers')
     if actual.all2all_backend == 'allgather_reducescatter':
-        from hcu_vllm_das.dspark_agrs import is_owned_draft, token_capacity
+        from hcu_vllm_das.dspark_agrs import _capacity_from_metadata, is_owned_draft, token_capacity
         if not is_owned_draft(config):
             errors.append('AG-RS is restricted to the owned DSpark draft configuration')
-        elif token_capacity(config) != config._hcu_dspark_capacity:
+        elif token_capacity(config) != _capacity_from_metadata(config):
             errors.append('DSpark query/verify capacity changed after construction')
         if not config.model_config.enforce_eager or p.prefill_context_parallel_size != 1:
-            errors.append('DSpark AG-RS requires eager PCP1')
+            from hcu_vllm_das.dspark_graph import native_decode_dspark, validate_graph_capacity
+
+            if not native_decode_dspark(config):
+                errors.append('DSpark AG-RS Graph requires native V41 DP8/EP8')
+            else:
+                validate_graph_capacity(config, moe)
     elif actual.all2all_backend not in ('deepep_high_throughput','deepep_low_latency'):
         errors.append('fixed DeepEP HT/LL or owned DSpark AG-RS is required')
     if not actual.use_ep:

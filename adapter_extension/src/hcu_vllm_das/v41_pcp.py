@@ -54,8 +54,9 @@ def validate_config(cfg) -> bool:
         errors.append('monokernel bypasses common PCP preparation')
     if cfg.kv_transfer_config is not None:
         errors.append('KV transfer requires a separate replicated-cache contract')
-    if cfg.cache_config.swa_bounded_replay:
-        errors.append('SWA bounded replay is not implemented by AMD PCP attention')
+    # SWA bounded replay: native decoder replay pads each rank's replay batch to
+    # the global kept rows and rebuilds PCP metadata for it; this attention reads
+    # only that metadata. Prefix-cache SWA replay stays off on ROCm natively.
     if getattr(cfg.model_config.hf_config, 'engram_layer_ids', None):
         from .v41_engram import validate_engram_config
         if not hasattr(cfg, 'engram_config'):

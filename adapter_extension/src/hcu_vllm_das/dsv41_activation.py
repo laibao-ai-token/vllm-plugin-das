@@ -86,6 +86,14 @@ def check_health() -> None:
                 raise refusal from error
         if not owned:
             _fatal("DSV4.1 public quantization registration changed owner")
+        try:
+            from .v41_engram_edp import check_engram_edp_guard
+            from .dspark_graph import check_dspark_graph_support
+
+            check_engram_edp_guard()
+            check_dspark_graph_support()
+        except RuntimeError as error:
+            _fatal(str(error))
 
 
 def activate_extension(context: ExtensionContext) -> None:
@@ -172,6 +180,14 @@ def activate_extension(context: ExtensionContext) -> None:
                     except ExtensionCommitError as refusal:
                         raise refusal from error
             _publication = (quant, config_class, register, resolve, draft_state)
+            try:
+                from .v41_engram_edp import install_engram_edp_guard
+                from .dspark_graph import install_dspark_graph_support
+
+                install_engram_edp_guard()
+                install_dspark_graph_support()
+            except RuntimeError as error:
+                raise Dsv41ActivationError(str(error)) from error
         finally:
             _publishing = False
 

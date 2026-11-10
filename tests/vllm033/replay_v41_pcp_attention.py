@@ -56,6 +56,7 @@ def admission():
     require()
     for n in (2,4,8,16):assert prod.validate_config(cfg(n))
     assert not prod.validate_config(cfg(1))
+    x=cfg();x.cache_config.swa_bounded_replay=True;assert prod.validate_config(x)
     for field,value in [('enforce_eager',False)]:
         x=cfg();setattr(x.model_config,field,value);reject(lambda:prod.validate_config(x))
     for field in ('decode_context_parallel_size','pipeline_parallel_size','data_parallel_size'):
@@ -86,6 +87,26 @@ def constructors():
     assert models.select_attention(cfg()) is prod.HcuV41PcpAttention
     reject(lambda:models._constructor(native_model.DeepseekV4Model.__init__,'bad',{}))
 
+
+def decoder_replay_gate():
+    require()
+    gate=models.HcuV41PcpBackbone._decoder_replay_supported
+    def backbone(**kw):
+        return NS(start_layer=0,end_layer=40,use_sequence_parallel=False,
+                  config=NS(num_hidden_layers=40,engram_layer_ids=kw.pop('engram',[1,14])),**kw)
+    def replay_cfg(width=8,ubatch=False):
+        x=cfg(width);x.cache_config.swa_bounded_replay=True
+        x.parallel_config.use_ubatching=ubatch;return x
+    assert gate(backbone(),replay_cfg(),20) is True
+    assert gate(backbone(),replay_cfg(ubatch=True),20) is False
+    assert gate(backbone(engram=[1,20]),replay_cfg(),20) is False
+    sp=backbone();sp.use_sequence_parallel=True;assert gate(sp,replay_cfg(),20) is False
+    stage=backbone();stage.end_layer=30;assert gate(stage,replay_cfg(),20) is False
+    # PCP1 keeps the exact native gate, which still refuses native PCP elsewhere.
+    calls=[]
+    with patch.object(models,'_REPLAY_NATIVE',lambda *a:calls.append(a) or 'native'):
+        assert gate(backbone(),replay_cfg(1),20)=='native' and len(calls)==1
+    assert models._REPLAY_NATIVE is native_model.DeepseekV4Model._decoder_replay_supported
 
 def publication():
     require()
@@ -231,7 +252,7 @@ def local_output():
     assert prod.HcuV41PcpAttention._o_proj is rocm.DeepseekV41ROCMAiterMLAAttention._o_proj
 
 
-for name,fn in [('admission_and_owned_backends',admission),('native_constructor_namespace',constructors),('public_model_publication',publication),('native_CR2_link_200x8',native_ring_200),('native_preparation_200x8',native_preparation_200),('production_FP8_local_scoring_200x8',local_indexer_200),('actual_local_output_and_padding',local_output)]:case(name,fn)
+for name,fn in [('admission_and_owned_backends',admission),('native_constructor_namespace',constructors),('decoder_replay_gate',decoder_replay_gate),('public_model_publication',publication),('native_CR2_link_200x8',native_ring_200),('native_preparation_200x8',native_preparation_200),('production_FP8_local_scoring_200x8',local_indexer_200),('actual_local_output_and_padding',local_output)]:case(name,fn)
 repo=Path(__file__).resolve().parents[2]
 functions=[native_model.DeepseekV4DecoderLayer.__init__,native_model.DeepseekV4Model.__init__,vl_model.DeepseekV41ForCausalLM.__init__]
 report=dict(cases=RESULTS,passed=sum(r['status']=='passed' for r in RESULTS),total=len(RESULTS),cuda_initialized=torch.cuda.is_initialized(),native_model_source=native_model.__file__,native_rocm_source=rocm.__file__,native_constructor_hashes={f'{f.__module__}.{f.__qualname__}':hashlib.sha256(inspect.getsource(f).encode()).hexdigest() for f in functions},vllm_metadata=importlib.metadata.version('vllm'),source_hashes={str(p.relative_to(repo)):hashlib.sha256(p.read_bytes()).hexdigest() for p in (repo/'adapter_extension/src/hcu_vllm_das').glob('v41_pcp*.py')},boundaries='CPU source replay; transports, projection/cache/GPU kernels doubled; no GPU/full model/Graph accuracy')

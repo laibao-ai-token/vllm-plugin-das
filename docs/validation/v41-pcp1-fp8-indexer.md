@@ -1,5 +1,20 @@
 # V41 PCP1 HCU FP8 indexer correctness route
 
+> Historical scope: the sections below record the initial `bbb99f3` eager,
+> default-OFF implementation. The current uncommitted 2026-11-06 candidate is
+> default-ON by explicit user choice and supports PIECEWISE breakable graphs.
+> The published environment/operator names retain `REFERENCE` for compatibility;
+> the device-only Triton decode is an **active candidate**, while the scalar CPU
+> implementation remains an independent replay reference. It is not certified
+> for deployment by its name, registration or component results.
+>
+> Current validation and remaining distributed blockers are tracked in
+> [v41-graph-replay-stall.md](v41-graph-replay-stall.md): 200 real-HCU numeric
+> cases and 400 changing-metadata capture/replays passed, alongside the existing
+> CPU 6/6 replay. Full-model DP8/EP8 graph completion and HumanEval acceptance are
+> still pending. The Adapter C4 bridge is ratio-4/NORMAL-only and cannot replace
+> this ratio-1/2 SHUFFLE candidate merely by widening an architecture gate.
+
 ## Scope and actual source findings
 
 Start Plugin3278f1e; Core read-only368701db06; Adapter read-only3257a934.

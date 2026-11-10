@@ -8,7 +8,7 @@ import torch
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.all2all_utils import maybe_make_prepare_finalize as native_make_prepare_finalize
-from vllm.model_executor.layers.fused_moe.deep_gemm_utils import compute_aligned_M, deepgemm_moe_permute, deepgemm_unpermute_and_reduce
+from vllm.model_executor.layers.fused_moe.deep_gemm_utils import compute_aligned_M, deepgemm_unpermute_and_reduce, ep_scatter
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import TopKWeightAndReduceDelegate, TopKWeightAndReduceNoOP
 from vllm.model_executor.layers.fused_moe.utils import _resize_cache
 from vllm.model_executor.layers.quantization.utils.quant_utils import kInt4W4A8StaticChannelSym, kInt8DynamicTokenSym
@@ -69,6 +69,36 @@ def make_prepare(moe,descriptor,routing_tables,config=None):
             raise RuntimeError('DeepEP HT group disagrees with loaded MoE')
         return HcuCTHTPrepareAndFinalize(native.buffer,native.num_dispatchers(),native.dp_size,native.rank_expert_offset)
     raise RuntimeError('HCU W4A8 requires a fixed native HT/LL prepare object')
+
+
+def deepgemm_moe_permute(*,aq,aq_scale,topk_ids,local_num_experts,expert_map,expert_tokens_meta,aq_out,block_size):
+    """Owned 256-aligned permutation using the 0.33 public ep_scatter kernel."""
+    if aq.ndim != 2 or aq_out is None or aq_out.shape[1] != aq.shape[1]:
+        raise ValueError('W4A8 permutation requires [M,K] activation and matching workspace')
+    aligned = aq_out.shape[0]
+    token_scale = aq_scale
+    if token_scale.ndim == 1:
+        token_scale = token_scale.unsqueeze(-1)
+    if not token_scale.is_contiguous():
+        token_scale = token_scale.contiguous()
+    counts = getattr(expert_tokens_meta, 'expert_num_tokens', None)
+    if counts is None:
+        from vllm.model_executor.layers.fused_moe.utils import count_expert_num_tokens
+        counts = count_expert_num_tokens(topk_ids, local_num_experts, expert_map)
+    if counts.dtype != torch.int32:
+        counts = counts.to(torch.int32)
+    if not counts.is_contiguous():
+        counts = counts.contiguous()
+    scale = torch.zeros((aligned, 1), dtype=torch.float32, device=aq_out.device)
+    indices = torch.full((aligned,), -1, dtype=torch.int32, device=aq_out.device)
+    inverse = torch.empty(topk_ids.shape, dtype=torch.int32, device=aq_out.device)
+    starts = torch.empty((local_num_experts,), dtype=torch.int32, device=aq_out.device)
+    ep_scatter(recv_x=aq, recv_x_scale=token_scale, recv_topk=topk_ids,
+        num_recv_tokens_per_expert=counts, expert_start_loc=starts, expert_map=expert_map,
+        output_tensor=aq_out, output_tensor_scale=scale, m_indices=indices,
+        output_index=inverse, align_m=256, block_size=block_size,
+        pack_ue8m0=False, use_psum_layout=False)
+    return aq_out, scale, indices, inverse, None
 
 
 class _Experts(mk.FusedMoEExpertsModular):

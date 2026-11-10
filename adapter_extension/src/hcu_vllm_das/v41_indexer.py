@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Explicit eager V41 FP8 indexer reference, with real 16x16 cache decoding.
+"""Graph-aware V41 FP8 indexer reference, with real 16x16 cache decoding.
 
 This correctness path owns scoring/selection only. Native V41 still produces K,
 cache metadata, shared candidate buffers and attention. No hardware identity,
@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import torch
 from vllm.config import get_current_vllm_config as current_config
+from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.utils.torch_utils import _resolve_layer_name
@@ -24,6 +25,7 @@ from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
 
 from .environment import _flag
 from .quantization.dsv41_channel_fp8 import _is_v41
+from .v41_indexer_graph import graph_capture_allowed, register_splitting_op
 
 logger = init_logger(__name__)
 FLAG = 'VLLM_HCU_DSV41_FP8_INDEXER_REFERENCE'
@@ -31,7 +33,11 @@ _registered = False
 
 
 def enabled():
-    return _flag(FLAG, default=False)
+    # HCU V41 FP8 indexer reference path is enabled by default on v0.33:
+    # the native FP8 indexer rejects AITER-off HCU before execution, so the
+    # reference path is the only usable decode route there. Set the flag to 0
+    # to fall back to the native path explicitly.
+    return _flag(FLAG, default=True)
 
 
 def _cache_flat(cache, head_dim):
@@ -78,6 +84,9 @@ def decode_logits(q, cache, weights, context_lens, block_tables, max_model_len):
         limits = context_lens
     else:
         raise ValueError('FP8 indexer requires final1D or effective2D context lengths')
+    if q.is_cuda:
+        from .v41_indexer_gpu import rectangular_logits
+        return rectangular_logits(q, cache, weights, context_lens, block_tables, max_model_len)
     logits = torch.full((batch * next_n, max_model_len), -float('inf'),
                         dtype=torch.float32, device=q.device)
     block = cache.shape[1]
@@ -127,6 +136,7 @@ def _select(logits, starts, ends, out, candidates, block_size, write):
     out.copy_(local_topk(logits, starts, ends, out.shape[1]))
 
 
+@eager_break_during_capture
 def indexer(hidden_states: torch.Tensor, prefix: str, cache: torch.Tensor,
             q: torch.Tensor, weights: torch.Tensor, topk_tokens: int,
             head_dim: int, max_model_len: int, total_seq_lens: int,
@@ -162,10 +172,11 @@ def indexer(hidden_states: torch.Tensor, prefix: str, cache: torch.Tensor,
                 or type(candidate_block_size) is not int or candidate_block_size <= 0):
             raise ValueError('V41 candidate schema requires int32 rows and positive block size')
         if meta.decode is not None and meta.decode.requires_padding:
-            counts = meta.decode.decode_lens.tolist()
-            padded_rows = len(counts) * max(counts, default=0)
-            if candidates.shape[0] < padded_rows:
-                raise ValueError('ragged candidate bank lacks padded request-major rows')
+            if not q.is_cuda:
+                counts = meta.decode.decode_lens.tolist()
+                padded_rows = len(counts) * max(counts, default=0)
+                if candidates.shape[0] < padded_rows:
+                    raise ValueError('ragged candidate bank lacks padded request-major rows')
             if meta.num_prefill_tokens:
                 raise ValueError('padded decode candidates overlap prefill rows; use separate batches')
     elif candidate_write:
@@ -184,6 +195,15 @@ def indexer(hidden_states: torch.Tensor, prefix: str, cache: torch.Tensor,
                                          weights[start:end], chunk.cu_seqlen_ks, chunk.cu_seqlen_ke)
             _select(logits, chunk.cu_seqlen_ks, chunk.cu_seqlen_ke, selected_out[start:end],
                     None if candidates is None else candidates[start:end], candidate_block_size, candidate_write)
+    if q.is_cuda:
+        if meta.num_decode_tokens:
+            if meta.decode is None:
+                raise ValueError('missing V41 decode metadata')
+            from .v41_indexer_gpu import decode_indexer
+            decode_indexer(q, cache, weights, meta.decode, meta.num_decode_tokens,
+                           selected_out, compress_ratio, candidates, candidate_block_size,
+                           candidate_write, max_model_len, _select)
+        return out
     if meta.num_decode_tokens:
         if meta.decode is None:
             raise ValueError('missing V41 decode metadata')
@@ -234,7 +254,8 @@ def register_op():
     from vllm.utils.torch_utils import direct_register_custom_op
     direct_register_custom_op(op_name='hcu_v41_fp8_indexer_reference', op_func=indexer,
                               mutates_args=['out', 'candidates'], fake_impl=_fake,
-                              dispatch_key='CompositeExplicitAutograd')
+                              dispatch_key='CompositeExplicitAutograd',
+                              tags=(torch._C.Tag.cudagraph_unsafe,))
     _registered = True
 
 
@@ -245,7 +266,23 @@ class HcuV41SparseAttnIndexer(SparseAttnIndexer):
         if is_v41:
             from .v41_indexer_activation import check_health
             check_health()
+            if enabled():
+                register_splitting_op(cfg)
         self._hcu_owned = enabled() and is_v41
+        from hcu_adapter.fp4_indexer import selected as fp4_selected
+        self._hcu_fp4 = is_v41 and fp4_selected()
+        if self._hcu_fp4:
+            from .fp4_indexer import preflight
+            preflight(cfg)
+            import inspect
+            values = inspect.signature(SparseAttnIndexer.__init__).bind(self, *args, **kwargs)
+            values.apply_defaults()
+            v = values.arguments
+            if (not v['use_fp4_cache'] or not v['skip_k_cache_insert']
+                    or v['compress_ratio'] not in (1, 2) or v['head_dim'] != 128):
+                raise ValueError('FP4 owner requires source-owned FP4 K, ratio1/2, D128')
+            super().__init__(*args, **kwargs)
+            return
         if self._hcu_owned:
             import inspect
             bound = inspect.signature(SparseAttnIndexer.__init__).bind(self, *args, **kwargs)
@@ -253,8 +290,11 @@ class HcuV41SparseAttnIndexer(SparseAttnIndexer):
             p = cfg.parallel_config
             if cfg.kernel_config.monokernel:
                 raise ValueError('V41 reference indexer cannot mix candidate buffers with monokernel producers')
-            if not cfg.model_config.enforce_eager:
-                raise ValueError('V41 reference indexer uses host metadata and requires eager execution')
+            if not cfg.model_config.enforce_eager and not graph_capture_allowed(cfg):
+                raise ValueError(
+                    'V41 reference indexer requires eager execution or a '
+                    'PIECEWISE breakable/inductor-split graph capture; '
+                    'full cudagraph cannot break out the host-metadata op')
             if p.prefill_context_parallel_size != 1 or p.decode_context_parallel_size != 1:
                 raise ValueError('V41 reference indexer requires PCP1/DCP1; PCP8 is a separate adapter')
             values = bound.arguments
@@ -263,10 +303,17 @@ class HcuV41SparseAttnIndexer(SparseAttnIndexer):
                 raise ValueError('V41 reference indexer requires source-owned FP8 K, ratio1/2, D128')
         super().__init__(*args, **kwargs)
         if self._hcu_owned:
-            logger.info('HCU_V41_FP8_INDEXER_REFERENCE: eager PCP1/DCP1 ratio=%s cache=%s',
+            logger.info('HCU_V41_FP8_INDEXER_REFERENCE: graph/eager PCP1/DCP1 ratio=%s cache=%s',
                         self.compress_ratio, self.k_cache.prefix)
 
     def forward_hip(self, hidden_states, q_quant, k, weights):
+        if getattr(self, '_hcu_fp4', False):
+            from .v41_indexer_activation import check_health
+            check_health()
+            if k is not None:
+                raise ValueError('FP4 reader must not insert a second K')
+            from .fp4_indexer_lightop import execute
+            return execute(self, hidden_states, q_quant, weights)
         if not self._hcu_owned:
             return super().forward_hip(hidden_states, q_quant, k, weights)
         if k is not None or not isinstance(q_quant, torch.Tensor):

@@ -8,6 +8,7 @@ from threading import RLock
 from hcu_adapter.extensions import ExtensionCommitError, ExtensionSpec
 from .dsv41_activation import _require_release
 from .environment import _flag
+from hcu_adapter.fp4_indexer import selected as fp4_selected
 
 _FLAG = 'VLLM_HCU_DSV41_PCP_ATTENTION'
 _HOST_FLAG = 'VLLM_HCU_DSV41_ENGRAM_HOST'
@@ -54,7 +55,7 @@ def host_enabled():
 
 
 def policy_factor():
-    return (pcp_enabled(), host_enabled())
+    return (pcp_enabled(), host_enabled(), True) if fp4_selected() else (pcp_enabled(), host_enabled())
 
 
 def _fatal(message):
@@ -80,6 +81,7 @@ def check_health():
                     or _function(ModelRegistry.register_model) is not _state['register']
                     or _flag(_FLAG, default=False) != _state['enabled']
                     or _flag(_HOST_FLAG, default=False) != _state['host']
+                    or fp4_selected() != _state.get('fp4', False)
                     or envs.environment_variables.get(_FACTOR) is not policy_factor):
                 _fatal('V41 PCP ownership/policy changed; restart process')
             loaded = sys.modules.get('hcu_vllm_das.models.v41_pcp')
@@ -109,7 +111,8 @@ def activate_extension(context):
             return
         pcp_selected = _flag(_FLAG, default=False)
         host_selected = _flag(_HOST_FLAG, default=False)
-        selected = pcp_selected or host_selected
+        fp4 = fp4_selected()
+        selected = pcp_selected or host_selected or fp4
         _publishing = True
         try:
             import inspect
@@ -130,7 +133,7 @@ def activate_extension(context):
             if _key(entry) != (_PLUGIN if selected else _NATIVE):
                 raise RuntimeError('V41 PCP model publication lost its owner')
             envs.environment_variables[_FACTOR] = policy_factor
-            _state = dict(enabled=pcp_selected, host=host_selected, registry=ModelRegistry, entry=entry, register=register)
+            _state = dict(enabled=pcp_selected, host=host_selected, fp4=fp4, registry=ModelRegistry, entry=entry, register=register)
             check_health()
         except BaseException as error:
             try:

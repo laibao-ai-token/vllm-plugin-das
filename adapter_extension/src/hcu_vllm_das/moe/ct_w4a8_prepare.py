@@ -51,7 +51,12 @@ class HcuCTLLPrepareAndFinalize(DeepEPLLPrepareAndFinalize):
             raise ValueError('HCU LL requires an admitted BF16 hidden size')
         if a1.shape[0] > self.max_tokens_per_rank:
             raise ValueError('HCU LL input exceeds checked token capacity')
-        if topk_ids.dtype != torch.int64 or topk_weights.dtype != torch.float32 or topk_ids.shape != topk_weights.shape or topk_ids.shape[0] != a1.shape[0]:
+        # v0.33 core routers emit int32 topk_ids; the legacy v0.29 plugin
+        # path used int64. Accept both, reject anything else.
+        if (topk_ids.dtype not in (torch.int32, torch.int64)
+                or topk_weights.dtype != torch.float32
+                or topk_ids.shape != topk_weights.shape
+                or topk_ids.shape[0] != a1.shape[0]):
             raise ValueError('HCU LL routing IDs/weights have incompatible shape or dtype')
         weights = topk_weights
         if apply_router_weight_on_input:

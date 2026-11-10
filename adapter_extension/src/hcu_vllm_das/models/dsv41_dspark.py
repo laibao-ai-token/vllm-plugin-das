@@ -63,10 +63,15 @@ class HcuDSparkDeepseekV41ForCausalLM(NativeDSpark):
 
     def __init__(self, *, vllm_config, prefix=""):
         from vllm.config import set_current_vllm_config
-        from hcu_vllm_das.quantization.ct_w4a8 import HcuDSV41CTW4A8Config
-        if (isinstance(vllm_config.quant_config, HcuDSV41CTW4A8Config)
-                and vllm_config.parallel_config.data_parallel_size > 1):
-            from hcu_vllm_das.dspark_agrs import draft_config
+        from hcu_vllm_das.dspark_agrs import _owned_quant_kind, draft_config
+
+        # CT W4A8 and Channel-FP8 drafts both take a private AG-RS construction
+        # config so they do not allocate a second DeepEP/RocSHMEM LL buffer on
+        # top of the target's already-resident weights.
+        if (
+            _owned_quant_kind(vllm_config) is not None
+            and vllm_config.parallel_config.data_parallel_size > 1
+        ):
             local = draft_config(vllm_config)
             # Native draft decoder construction reads current_config as well as
             # its explicit argument. Keep both references on the same private

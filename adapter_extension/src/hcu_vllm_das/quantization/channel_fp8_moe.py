@@ -38,6 +38,11 @@ class HcuDSV41ChannelFP8MoEMethod(CompressedTensorsW8A8Fp8MoEMethod):
         self.weight_block_size = None
         self.block_quant = self.static_input_scales = False
         self._layer_name = layer_name
+        # Capture construction-time VllmConfig so AG-RS draft process_weights
+        # can validate ownership after set_current_vllm_config restores target.
+        from vllm.config import get_current_vllm_config
+
+        self._config = get_current_vllm_config()
         self._backend_mode = runtime.select_channel_backend(moe.moe_parallel_config, requested=moe.moe_backend)
         self.experts_cls = runtime.ChannelFP8MaskedExperts if self._backend_mode == "ll" else runtime.ChannelFP8ContiguousExperts
         self._packed = None
@@ -65,8 +70,17 @@ class HcuDSV41ChannelFP8MoEMethod(CompressedTensorsW8A8Fp8MoEMethod):
             return
         # Prepare construction validates the route before destructive parameter replacement.
         quant_config = self.get_fused_moe_quant_config(layer)
-        prepare = make_channel_prepare(self.moe, quant_config, layer._expert_routing_tables())
-        expected = HcuChannelFP8LLPrepareAndFinalize if self._backend_mode == "ll" else HcuChannelFP8HTPrepareAndFinalize
+        prepare = make_channel_prepare(
+            self.moe, quant_config, layer._expert_routing_tables(), config=self._config
+        )
+        if self._backend_mode == "ll":
+            expected = HcuChannelFP8LLPrepareAndFinalize
+        elif self._backend_mode == "ht":
+            expected = HcuChannelFP8HTPrepareAndFinalize
+        else:
+            from hcu_vllm_das.dspark_agrs import HcuChannelFP8AgRsPrepareAndFinalize
+
+            expected = HcuChannelFP8AgRsPrepareAndFinalize
         if not isinstance(prepare, expected):
             raise runtime.ChannelFP8RuntimeError("Channel-FP8 prepare owner/backend mismatch")
         limits = dict(max_num_tokens=prepare.max_num_tokens_per_rank(), num_dispatchers=prepare.num_dispatchers()) if self._backend_mode == "ll" else {}

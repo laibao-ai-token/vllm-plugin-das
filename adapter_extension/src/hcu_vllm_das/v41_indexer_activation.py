@@ -9,6 +9,7 @@ from hcu_adapter.extensions import ExtensionCommitError, ExtensionSpec
 
 from .dsv41_activation import _require_release
 from .environment import _flag
+from hcu_adapter.fp4_indexer import selected as fp4_selected
 
 _state = None
 _failure = None
@@ -35,7 +36,9 @@ def _is_hcu():
 
 
 def policy_factor():
-    return _state['enabled'] if _state is not None else _flag(_FLAG, default=False)
+    if _state is not None and _state.get('fp4', False):
+        return ('fp4-lightop', _state['digest'])
+    return _state['enabled'] if _state is not None else _flag(_FLAG, default=True)
 
 
 def _fatal(message):
@@ -57,7 +60,8 @@ def check_health():
         from vllm.model_executor import custom_op
         try:
             valid = (
-                _flag(_FLAG, default=False) == _state['enabled']
+                _flag(_FLAG, default=True) == _state['enabled']
+                and fp4_selected() == _state.get('fp4', False)
                 and custom_op.op_registry_oot is _state['registry']
                 and custom_op.op_registry_oot.get('SparseAttnIndexer') is _state['class']
                 and envs.environment_variables.get(_FACTOR) is policy_factor
@@ -66,6 +70,13 @@ def check_health():
             )
             if not valid:
                 _fatal('V41 indexer ownership/policy changed; restart process')
+            if _state.get('fp4', False):
+                from . import fp4_packer
+                from .fp4_indexer_lightop import load_providers
+                from .fp4_indexer import check_native_contract
+                fp4_packer.check_health()
+                load_providers()
+                check_native_contract()
         except ExtensionCommitError:
             raise
         except BaseException as error:
@@ -95,7 +106,25 @@ def activate_extension(context):
         _require_release(context.vllm_version)
         if not _is_hcu():
             return
-        selected = _flag(_FLAG, default=False)
+        selected = _flag(_FLAG, default=True)
+        fp4 = fp4_selected()
+        digest = None
+        if fp4:
+            from . import fp4_packer
+            from .fp4_indexer_lightop import load_providers
+            from hcu_adapter import hcu_env
+            if hcu_env.resolve('HCU_VLLM_SPARSE_INDEXER_IMPL', host='vllm')[0] != 'stock':
+                raise RuntimeError('C4 and V41 FP4 cannot own the same OOT key')
+            fp4_packer.check_health()
+            if fp4_packer._state is None or fp4_packer._state['mode'] != 'triton':
+                raise RuntimeError('FP4 requires published triton lowering')
+            load_providers()
+            import hashlib
+            from pathlib import Path
+            digest = hashlib.sha256()
+            for name in ('fp4_indexer.py', 'fp4_indexer_lightop.py', 'v41_indexer.py'):
+                digest.update(Path(__file__).with_name(name).read_bytes())
+            digest = digest.hexdigest()
         _publishing = True
         try:
             from vllm import envs
@@ -122,9 +151,16 @@ def activate_extension(context):
             # The public OOT key is the class name; the compilation switch is
             # the original lower-case op name. Preserve the latter for users.
             HcuV41SparseAttnIndexer.name = SparseAttnIndexer.name
-            _state = dict(enabled=selected, registry=registry, **{
+            _state = dict(enabled=selected, fp4=fp4, digest=digest, registry=registry, **{
                 'class': HcuV41SparseAttnIndexer, 'native': SparseAttnIndexer,
                 'forward': SparseAttnIndexer.forward_hip})
+            if fp4:
+                from hcu_adapter import registry as adapter_registry
+                adapter_registry.register(
+                    op='vllm_fp4_indexer', impl='lightop',
+                    target='vllm.model_executor.layers.sparse_attn_indexer.SparseAttnIndexer',
+                    mechanism=adapter_registry.MECH_SEAM, source=__name__,
+                    detail='FP4 branch of existing V41 OOT; native/model gates pending')
             check_health()
         except BaseException as error:
             try:
@@ -137,5 +173,6 @@ def activate_extension(context):
 
 def extension_spec():
     return ExtensionSpec(name='das-hcu-v41-indexer', api_version=1, priority=115,
-        capabilities=frozenset({'hcu-v41-fp8-indexer-eager-reference'}),
+        capabilities=frozenset({'hcu-v41-fp8-indexer-eager-reference',
+                                'hcu-v41-fp8-indexer-graph-break'}),
         activate=activate_extension, check_health=check_health)
