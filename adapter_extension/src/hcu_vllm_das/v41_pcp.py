@@ -26,7 +26,7 @@ def validate_config(cfg) -> bool:
     """Validate the native PCP structure before allocating model parameters.
 
     Width is unconstrained. PP/DP/DCP=1 follows the native V41 PCP contract;
-    speculative decoding needs a larger CR2 ring contract than Core provides.
+    DSpark uses the owned CR2 history metadata for rejection rollback.
     Engram uses the owned private registered-host TPxPCP table adapter.
     """
     p = cfg.parallel_config
@@ -43,7 +43,11 @@ def validate_config(cfg) -> bool:
         if getattr(p, name) != 1:
             errors.append(f'{name}=1 required by native V41 PCP metadata')
     if cfg.speculative_config is not None:
-        errors.append('native PCP CR2 ring does not support speculative decoding')
+        from .pcp_dspark import validate_dspark_config
+        try:
+            validate_dspark_config(cfg)
+        except ValueError as error:
+            errors.append(str(error))
     if cfg.lora_config is not None or p.enable_eplb:
         errors.append('LoRA/EPLB are not supported by this PCP model adapter')
     if p.enable_dbo:

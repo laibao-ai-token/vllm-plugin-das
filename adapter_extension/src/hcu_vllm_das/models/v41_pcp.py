@@ -61,6 +61,9 @@ def check_native_contract():
 def select_attention(cfg):
     if not validate_config(cfg):
         return native._select_dsv4_attn_cls(cfg)
+    if cfg.speculative_config is not None:
+        from ..pcp_dspark import HcuV41PcpDSparkAttention
+        return HcuV41PcpDSparkAttention
     return HcuV41PcpAttention
 
 
@@ -96,7 +99,7 @@ class HcuV41PcpBackbone(native.DeepseekV4Model):
 
         Native model state pads each rank's replay batch to the global kept
         rows and rebuilds PCP metadata for it; owned PCP attention reads only
-        that metadata. validate_config already pins PP/DP=1 and no drafter.
+        that metadata. validate_config already pins PP/DP=1.
         """
         if not validate_config(vllm_config):
             return _REPLAY_NATIVE(self, vllm_config, cut)
@@ -106,6 +109,15 @@ class HcuV41PcpBackbone(native.DeepseekV4Model):
             reason = 'sequence parallel and microbatching cannot follow the replay batch'
         elif any(i >= cut for i in getattr(self.config, 'engram_layer_ids', ())):
             reason = 'an Engram layer sits at or after the last KV source layer'
+        elif vllm_config.speculative_config is not None and (
+            getattr(vllm_config.speculative_config.draft_model_config.hf_config,
+                    'sliding_window', None) is None
+            or vllm_config.speculative_config.draft_model_config.hf_config.sliding_window
+                > self.config.sliding_window
+            or any(kind != 'sliding_attention' for kind in getattr(
+                vllm_config.speculative_config.draft_model_config.hf_config, 'layer_types', ()))
+        ):
+            reason = 'the drafter reads hidden states outside the target replay window'
         else:
             return True
         native.logger.warning_once('Decoder SWA bounded replay is off: %s.', reason)

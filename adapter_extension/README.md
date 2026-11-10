@@ -107,7 +107,7 @@ unverified. See [target loading and empty-row validation](../docs/validation/dsv
   development, patch, and local version suffixes are accepted when the
   required operator APIs and LightOp capabilities are present. FLASH_ATTN uses
   the official public backend registry and AttentionImpl contract.
-- Adapter distribution: `sgl-kernel>=0.1.0`, extension API v1 from
+- Adapter distribution: `hcu-adapter>=0.5.22`, extension API v1 from
   `hcu_adapter.extensions`.
 - Runtime: a prepared HCU PyTorch/DTK/LightOp/AITER stack. LightOp and AITER
   are intentionally not fetched by pip because production deployments must
@@ -130,6 +130,7 @@ dependency resolution, in this order:
 ```bash
 python3 -m pip install --no-deps /wheels/vllm-0.33.0+*.whl
 python3 -m pip install --no-deps /wheels/sgl_kernel-*.whl
+python3 -m pip install --no-deps /wheels/hcu_adapter-*.whl
 python3 -m pip install --no-deps /wheels/hcu_vllm_das_plugin-*.whl
 ```
 
@@ -147,6 +148,102 @@ vLLM's public OOT registry selects `hcu_vllm_das.rms_norm.HcuRMSNorm`.
 Schema4 additionally verifies that the seven official INT8 oracle symbols
 remain identical across activation, the module is owned by the Core wheel,
 and explicit Triton selection resolves to an official expert.
+
+## Static EPLB calibration and dummy loading
+
+Static EPLB calibration excludes the startup memory-profile forward, whose
+attention metadata is absent even though Core marks its dummy tokens as real
+for MoE memory accounting. Other padded warmup rows are excluded by the
+published unpadded-token counter. Real client calibration requests contribute
+to the cumulative counters and periodic map proposals.
+
+With `--load-format dummy`, deployment binds and verifies the offline layout
+in the model post-load hook. It preserves packed dummy tensors and publishes
+routing without rebinding checkpoint weight loaders. Normal checkpoint loading
+still binds replica fan-out before quantization. Static EPLB uses the PCP
+decoder replay gate. Select `HCU_VLLM_FP4_INDEXER_IMPL=stock` for PCP static
+EPLB. The separate PCP1 FP4 model rejects static EPLB.
+
+CPU regressions run through `tests/vllm033/run_v41_static_eplb_cpu.sh` and cover
+profile/warmup exclusion, real requests, and dummy post-load routing. GPU
+router execution, full-model output and performance require device validation.
+
+## Eager PCP DSpark with static EPLB
+
+The owned V41 PCP target accepts DSpark with an eager V41 draft, TP1 and the
+existing PP1/DP1/DCP1 topology. Static placement applies to target backbone MoE
+layers. The draft retains its native expert layout. Keep global `--enable-eplb`
+off and supply the placement through `additional_config.hcu_static_eplb`.
+
+The owned compressor metadata retains the complete circular-buffer window
+across PCP ranks. This supplies earlier CR2 predecessor states after a rejected
+draft restarts verification behind the previous end position. Native metadata
+building, compression and ring-store kernels consume the owned history. Private
+constructor namespaces select the owned cache and metadata backend.
+
+`tests/vllm033/test_pcp_dspark.py` covers every N5 rejection position, selected
+N13 positions, multiple requests, changing decode owners, and real two-process
+Gloo gathers with an empty rank. These CPU tests replace device compression and
+ring-store kernels with checking doubles. Source replay and CPU tests do not
+establish full-model accuracy or device performance.
+
+The Channel-FP8 device comparison uses
+`tests/vllm033/launch_pcp_dspark_gpu.sh` and
+`tests/vllm033/validate_pcp_dspark_gpu.py`. It runs static EPLB with DSpark off
+and on, reuses the same three prompts, and generates 32 tokens per prompt twice.
+It saves commands, responses, metrics, server logs and token comparisons under
+`HCU_VALIDATION_OUTPUT` (by default a unique directory under `test-results`). The comparison
+explicitly disables SWA replay and Layer Split and selects stock Adapter FP4
+indexer/packer and mHC, allowing the Plugin's mHC registration.
+
+Use an existing runtime with the matching Core, Adapter, Plugin and HCU vendor
+libraries. Configure the source workspace, model and calibrated layout before
+running the device checks. The source workspace contains `vllm/` and
+`adapter-das/`; installed Core and Adapter packages can also supply those imports.
+
+```bash
+export HCU_VALIDATION_ROOT=/path/to/source-workspace
+export HCU_VALIDATION_MODEL=/path/to/Channel-FP8-model
+export HCU_VALIDATION_EXPERT_MAP=/path/to/expert_map.json
+export HCU_VALIDATION_PYTHON=/path/to/runtime/bin/python
+export HCU_VALIDATION_OUTPUT=/path/to/new-results-directory
+# Optional overrides include HCU_VALIDATION_PORT, VLLM_HOST_IP,
+# VLLM_TARGET_ROOT and HCU_ADAPTER_SOURCE.
+bash tests/vllm033/launch_pcp_dspark_gpu.sh --dry-run
+bash tests/vllm033/launch_pcp_dspark_gpu.sh
+```
+
+The HumanEval wrapper uses the included `evaluate_humaneval.py` HTTP client.
+Install EvalScope 1.14.1 and datasets 4.8.4 in its interpreter, then provide the
+local dataset directory containing
+`openai_humaneval/test-00000-of-00001.parquet`. It verifies all 164 task IDs
+before launching the service and runs two 16-request warmup rounds before scoring.
+
+```bash
+export HCU_HUMANEVAL_DATA=/path/to/local-humaneval
+export HCU_HUMANEVAL_PYTHON=/path/to/evalscope/bin/python
+export VALIDATION_SCRIPT="$PWD/tests/vllm033/run_pcp_dspark_humaneval.py"
+bash tests/vllm033/launch_pcp_dspark_gpu.sh --dry-run
+bash tests/vllm033/launch_pcp_dspark_gpu.sh
+```
+
+The 2026-11-10 nmz22 run completed both services and both generation rounds.
+Each phase produced 192 output tokens. DSpark reported 76 drafts, 380 draft
+tokens and 114 accepted tokens. Two of six paired completions matched exactly.
+All three baseline prompts also differed between the baseline's own repeats.
+Consequently device startup and continuous generation were exercised, while
+output equivalence remains unresolved. The validation services were stopped.
+
+The full HumanEval run on 2026-11-10 used the existing
+`accuracy/humaneval.py` EvalScope 1.14.1 client, concurrency 16, temperature 0,
+thinking disabled, and at most 2048 output tokens. After two 16-request warmup
+rounds it completed 164 unique tasks with static EPLB32 and DSpark5. The result
+was 156/164, Pass@1 95.12195%, with zero API errors and 164 normal stop reasons.
+Failed task IDs were 32, 67, 97, 103, 115, 132, 145 and 163. Commands, data
+fingerprint, generated answers, code-test reviews and reports are retained under
+`logs/eplb_dspark_20261110/humaneval_20261110_215343_40039` in the surrounding
+project. `summary.json` and `failed_cases.json` provide the verified counts and
+failure details. This is code functional accuracy for the recorded configuration.
 
 ## INT8 ownership and unavailable AITER model integration
 
