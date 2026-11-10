@@ -134,7 +134,7 @@ def collect_attestation() -> dict[str, object]:
     """Return a fail-closed installed-state attestation."""
 
     vllm_dist, vllm_owned, vllm_record = _distribution("vllm")
-    adapter_dist, adapter_owned, adapter_record = _distribution("sgl-kernel")
+    adapter_dist, adapter_owned, adapter_record = _distribution("hcu-adapter")
     plugin_dist, plugin_owned, plugin_record = _distribution(
         "hcu-vllm-das-plugin"
     )
@@ -154,13 +154,13 @@ def collect_attestation() -> dict[str, object]:
         "vllm.platform_plugins",
         name="hcu_adapter",
         value="hcu_adapter.bridges.vllm:hcu_platform_plugin",
-        distribution="sgl-kernel",
+        distribution="hcu-adapter",
     )
     _require_entry_point(
         "vllm.general_plugins",
         name="hcu_adapter",
         value="hcu_adapter.bridges.vllm:hcu_runtime_plugin",
-        distribution="sgl-kernel",
+        distribution="hcu-adapter",
     )
     extension_point = _require_entry_point(
         "hcu_adapter.extensions",
@@ -175,10 +175,10 @@ def collect_attestation() -> dict[str, object]:
     plugin_extension = _import_module("hcu_vllm_das.extension")
     vllm_origin = _module_origin(vllm_module, vllm_owned, "vllm")
     adapter_origin = _module_origin(
-        adapter_extensions, adapter_owned, "sgl-kernel"
+        adapter_extensions, adapter_owned, "hcu-adapter"
     )
     adapter_bridge_origin = _module_origin(
-        adapter_bridge, adapter_owned, "sgl-kernel"
+        adapter_bridge, adapter_owned, "hcu-adapter"
     )
     plugin_origin = _module_origin(
         plugin_extension, plugin_owned, "hcu-vllm-das-plugin"

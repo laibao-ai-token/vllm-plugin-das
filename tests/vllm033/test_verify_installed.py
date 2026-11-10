@@ -93,14 +93,14 @@ def installed_fixture(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
             site,
             ["vllm/__init__.py", "vllm/model_executor/layers/fused_moe/oracle/int8.py", "vllm-0.33.0.dist-info/RECORD"],
         ),
-        "sgl-kernel": FakeDistribution(
-            "sgl-kernel",
+        "hcu-adapter": FakeDistribution(
+            "hcu-adapter",
             "0.1.0",
             site,
             [
                 "hcu_adapter/extensions.py",
                 "hcu_adapter/bridges/vllm.py",
-                "sgl_kernel-0.1.0.dist-info/RECORD",
+                "hcu_adapter-0.5.22+hcu.1.dist-info/RECORD",
             ],
         ),
         "hcu-vllm-das-plugin": FakeDistribution(
@@ -122,14 +122,14 @@ def installed_fixture(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
             FakeEntryPoint(
                 "hcu_adapter",
                 "hcu_adapter.bridges.vllm:hcu_platform_plugin",
-                distributions["sgl-kernel"],
+                distributions["hcu-adapter"],
             )
         ],
         "vllm.general_plugins": [
             FakeEntryPoint(
                 "hcu_adapter",
                 "hcu_adapter.bridges.vllm:hcu_runtime_plugin",
-                distributions["sgl-kernel"],
+                distributions["hcu-adapter"],
             )
         ],
         "hcu_adapter.extensions": [
