@@ -10,6 +10,7 @@ _FALSE_VALUES = frozenset({"0", "false", "no", "off"})
 _MASTER_SWITCH = "VLLM_HCU_USE_CUSTOM_OPS"
 _RMS_NORM_SWITCH = "VLLM_HCU_USE_CUSTOM_RMS_NORM"
 _RMS_NORM_COMPILE_FACTOR = "VLLM_HCU_DAS_RMS_NORM_ENABLED"
+_CANDIDATE_BLOCKS_SWITCH = "VLLM_HCU_USE_LIGHTOP_DSV41_CANDIDATE_BLOCKS"
 
 
 def _flag(name: str, *, default: bool) -> bool:
@@ -40,6 +41,20 @@ def rms_norm_enabled() -> bool:
     return master_enabled and child_enabled
 
 
+def candidate_blocks_enabled() -> bool:
+    """Return whether the LightOp DSV4.1 decode candidate producer is enabled.
+
+    Default ON: the LightOp producer is the production path for decode candidate
+    rows, and the upstream Triton chain remains the fallback when its contract
+    does not match. The master switch stays the highest-priority rollback,
+    exactly as for the RMSNorm path, and an explicit value still overrides.
+    """
+
+    master_enabled = custom_ops_enabled()
+    child_enabled = _flag(_CANDIDATE_BLOCKS_SWITCH, default=True)
+    return master_enabled and child_enabled
+
+
 def register_compile_factors(vllm_envs: object) -> None:
     """Include effective RMS policy in vLLM's normal and AOT cache keys.
 
@@ -59,4 +74,9 @@ def register_compile_factors(vllm_envs: object) -> None:
     registry[_RMS_NORM_COMPILE_FACTOR] = rms_norm_enabled
 
 
-__all__ = ["custom_ops_enabled", "rms_norm_enabled", "register_compile_factors"]
+__all__ = [
+    "candidate_blocks_enabled",
+    "custom_ops_enabled",
+    "rms_norm_enabled",
+    "register_compile_factors",
+]

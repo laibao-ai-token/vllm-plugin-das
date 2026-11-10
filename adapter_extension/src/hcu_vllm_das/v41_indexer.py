@@ -23,7 +23,7 @@ from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
     rocm_aiter_sparse_attn_indexer as native_indexer,
 )
 
-from .environment import _flag
+from .environment import _flag, candidate_blocks_enabled
 from .quantization.dsv41_channel_fp8 import _is_v41
 from .v41_indexer_graph import graph_capture_allowed, register_splitting_op
 
@@ -127,6 +127,104 @@ def local_topk(logits, starts, ends, k):
     return output
 
 
+def _lightop_decode_candidate_blocks(logits, ends, candidates, block_size):
+    """Write DSV4.1 decode candidate blocks through the LightOp producer.
+
+    The public LightOp API allocates and returns both an expanded mask and the
+    block IDs. The mask is deliberately discarded: the caller already holds the
+    logits it needs, and only the IDs feed the shared candidate bank.
+
+    ``candidates`` here is the caller-owned destination for exactly these rows.
+    On the padded decode path ``v41_indexer_gpu.decode_indexer`` hands in a
+    compact ``(rows, width)`` scratch tensor and performs the request-major
+    ``index_copy_`` itself afterwards, so this helper must never reach past
+    ``candidates.shape[0]`` into a wider shared buffer.
+
+    Only the decode call sites use this helper. The LightOp contract takes
+    per-row lengths and always indexes packed columns from 0, while the upstream
+    helper also accepts the non-zero ``starts`` vector that prefill chunks pass.
+    Decode always starts each row at column 0, so the two agree there; prefill
+    keeps the Triton chain and never reaches this function.
+
+    The producer returns ascending block IDs whereas the upstream helper keeps
+    top-k score order. ``apply_candidate_mask`` reduces the IDs into a per-block
+    flag table, so it is invariant to both the order and the -1 placement; the
+    set is what carries meaning.
+
+    Returns True only when the LightOp producer ran. Contract mismatches return
+    False so the caller keeps the upstream Triton chain; a native execution
+    failure is not converted into a silent fallback.
+    """
+    if not candidate_blocks_enabled():
+        return False
+    if (
+        logits.ndim != 2
+        or not logits.is_cuda
+        or logits.dtype != torch.float32
+        or not logits.is_contiguous()
+        or logits.shape[0] == 0
+        or logits.shape[1] == 0
+        or logits.shape[1] % 8 != 0
+        or block_size != 8
+        or candidates.ndim != 2
+        or candidates.dtype != torch.int32
+        or not candidates.is_cuda
+        or not candidates.is_contiguous()
+        or candidates.device != logits.device
+        or candidates.shape[0] != logits.shape[0]
+        or ends.ndim != 1
+        or ends.dtype not in (torch.int32, torch.int64)
+        or ends.device != logits.device
+        or ends.shape[0] != logits.shape[0]
+        or not ends.is_contiguous()
+    ):
+        return False
+    try:
+        from lightop import attention
+    except (ImportError, AttributeError):
+        return False
+    producer = getattr(attention, 'dsv41_select_candidate_blocks', None)
+    if not callable(producer):
+        return False
+    rows = logits.shape[0]
+    width = candidates.shape[1]
+    lengths = ends.to(torch.int32)
+    result = producer(logits, lengths, width, 8)
+    if not isinstance(result, tuple) or len(result) != 2:
+        raise RuntimeError(
+            'LightOp dsv41_select_candidate_blocks returned an invalid result')
+    mask, block_ids = result
+    if (
+        mask.shape != logits.shape
+        or mask.dtype != torch.bool
+        or mask.device != logits.device
+        or block_ids.shape != (rows, width)
+        or block_ids.dtype != torch.int32
+        or block_ids.device != logits.device
+    ):
+        raise RuntimeError(
+            'LightOp dsv41_select_candidate_blocks returned an invalid layout')
+    candidates.copy_(block_ids)
+    return True
+
+
+def _select_decode(logits, starts, ends, out, candidates, block_size, write):
+    """Decode-only selection: every row's packed columns start at 0.
+
+    Split from ``_select`` so the LightOp producer is chosen statically by call
+    site instead of by reading ``starts`` back to the host, which would add a
+    synchronisation to every decode step and break graph replay.
+    """
+    if candidates is not None:
+        if write:
+            if not _lightop_decode_candidate_blocks(logits, ends, candidates, block_size):
+                select_candidate_blocks(logits, starts, ends, candidates.shape[1],
+                                        block_size, candidates)
+        else:
+            apply_candidate_mask(logits, starts, ends, candidates, block_size)
+    out.copy_(local_topk(logits, starts, ends, out.shape[1]))
+
+
 def _select(logits, starts, ends, out, candidates, block_size, write):
     if candidates is not None:
         if write:
@@ -202,7 +300,7 @@ def indexer(hidden_states: torch.Tensor, prefix: str, cache: torch.Tensor,
             from .v41_indexer_gpu import decode_indexer
             decode_indexer(q, cache, weights, meta.decode, meta.num_decode_tokens,
                            selected_out, compress_ratio, candidates, candidate_block_size,
-                           candidate_write, max_model_len, _select)
+                           candidate_write, max_model_len, _select_decode)
         return out
     if meta.num_decode_tokens:
         if meta.decode is None:
@@ -235,8 +333,8 @@ def indexer(hidden_states: torch.Tensor, prefix: str, cache: torch.Tensor,
             starts = torch.zeros(count, dtype=torch.int64, device=q.device)
             bank_start = req * candidate_stride if candidate_stride is not None else offset
             bank_rows = None if candidates is None else candidates[bank_start:bank_start + count]
-            _select(logits, starts, limits.reshape(-1), selected_out[offset:end],
-                    bank_rows, candidate_block_size, candidate_write)
+            _select_decode(logits, starts, limits.reshape(-1), selected_out[offset:end],
+                           bank_rows, candidate_block_size, candidate_write)
             offset = end
     return out
 
