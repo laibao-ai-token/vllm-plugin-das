@@ -142,6 +142,15 @@ _HOST_OUTER_INIT = _constructor(_OUTER_NATIVE, _REVIEWED[2],
 
 class HcuV41PcpForCausalLM(native_vl.DeepseekV41ForCausalLM):
     def __init__(self, *, vllm_config, prefix=''):
+        from hcu_adapter.fp4_indexer import selected as fp4_selected
+        if fp4_selected():
+            from ..fp4_indexer import preflight
+            preflight(vllm_config)
+            from ..v41_pcp_activation import check_health
+            check_health()
+            check_native_contract()
+            _FP4_OUTER_INIT(self, vllm_config=vllm_config, prefix=prefix)
+            return
         from ..v41_pcp_activation import check_health
         check_health()
         check_native_contract()
@@ -156,3 +165,39 @@ class HcuV41PcpForCausalLM(native_vl.DeepseekV41ForCausalLM):
         else:
             # PCP1 without the explicit host route remains fully native.
             super().__init__(vllm_config=vllm_config, prefix=prefix)
+
+
+def _fp4_attention(cfg):
+    from ..fp4_indexer import Fp4Attention, preflight
+    preflight(cfg)
+    return Fp4Attention
+
+
+_FP4_DECODER_INIT = _constructor(_DECODER_NATIVE, _REVIEWED[0],
+                                {'_select_dsv4_attn_cls': _fp4_attention})
+_FP4_HOST_DECODER_INIT = _constructor(_DECODER_NATIVE, _REVIEWED[0],
+                                     {'_select_dsv4_attn_cls': _fp4_attention,
+                                      'Engram': HcuV41HostEngram})
+
+
+class HcuV41Fp4DecoderLayer(native.DeepseekV4DecoderLayer):
+    def __init__(self, *args, **kwargs):
+        cfg = args[0] if args else kwargs['vllm_config']
+        init = _FP4_HOST_DECODER_INIT if use_host_target(cfg) else _FP4_DECODER_INIT
+        init(self, *args, **kwargs)
+
+
+_FP4_BACKBONE_INIT = _constructor(_BACKBONE_NATIVE, _REVIEWED[1],
+                                 {'DeepseekV4DecoderLayer': HcuV41Fp4DecoderLayer})
+
+
+class HcuV41Fp4Backbone(native.DeepseekV4Model):
+    __init__ = _FP4_BACKBONE_INIT
+
+
+class HcuV41Fp4LLM(native.DeepseekV41LLMForCausalLM):
+    model_cls = HcuV41Fp4Backbone
+
+
+_FP4_OUTER_INIT = _constructor(_OUTER_NATIVE, _REVIEWED[2],
+                              {'DeepseekV41LLMForCausalLM': HcuV41Fp4LLM})

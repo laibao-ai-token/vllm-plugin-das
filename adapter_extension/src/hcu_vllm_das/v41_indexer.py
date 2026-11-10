@@ -269,6 +269,20 @@ class HcuV41SparseAttnIndexer(SparseAttnIndexer):
             if enabled():
                 register_splitting_op(cfg)
         self._hcu_owned = enabled() and is_v41
+        from hcu_adapter.fp4_indexer import selected as fp4_selected
+        self._hcu_fp4 = is_v41 and fp4_selected()
+        if self._hcu_fp4:
+            from .fp4_indexer import preflight
+            preflight(cfg)
+            import inspect
+            values = inspect.signature(SparseAttnIndexer.__init__).bind(self, *args, **kwargs)
+            values.apply_defaults()
+            v = values.arguments
+            if (not v['use_fp4_cache'] or not v['skip_k_cache_insert']
+                    or v['compress_ratio'] not in (1, 2) or v['head_dim'] != 128):
+                raise ValueError('FP4 owner requires source-owned FP4 K, ratio1/2, D128')
+            super().__init__(*args, **kwargs)
+            return
         if self._hcu_owned:
             import inspect
             bound = inspect.signature(SparseAttnIndexer.__init__).bind(self, *args, **kwargs)
@@ -293,6 +307,13 @@ class HcuV41SparseAttnIndexer(SparseAttnIndexer):
                         self.compress_ratio, self.k_cache.prefix)
 
     def forward_hip(self, hidden_states, q_quant, k, weights):
+        if getattr(self, '_hcu_fp4', False):
+            from .v41_indexer_activation import check_health
+            check_health()
+            if k is not None:
+                raise ValueError('FP4 reader must not insert a second K')
+            from .fp4_indexer_lightop import execute
+            return execute(self, hidden_states, q_quant, weights)
         if not self._hcu_owned:
             return super().forward_hip(hidden_states, q_quant, k, weights)
         if k is not None or not isinstance(q_quant, torch.Tensor):

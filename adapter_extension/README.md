@@ -24,6 +24,37 @@ and retains a Plugin E5M2 writer and descale adapter. The kernel page is 64
 tokens. It neither copies nor replaces the official Flash forward method and
 does not require private HCU hooks in the Core.
 
+## E2M1 packer lowering (opt-in, default stock)
+
+`das_hcu_fp4_packer` rebinds Core's `_fp32x2_to_fp4x2` E2M1 packer at startup.
+The audited upstream body emits PTX `cvt.rn.satfinite.e2m1x2.f32` with the
+`=r,f,f` constraint, which DTK clang cannot lower (029 `BLOCKED_TOOLCHAIN`).
+The replacement is Plugin-owned arithmetic: `min(|x|, 6)` saturation, seven
+thresholds, tie-to-even on the magnitude code, and the IEEE sign bit (so `-0`
+stays `0x8`). The first argument keeps the low nibble.
+
+Activation requires real HCU `gfx938`, vLLM `0.33.*`, an exact AST match with
+the audited definition plus identical aliases in six namespaces, an unhashed
+and uncompiled caller set, no foreign compile factor, and no existing runtime
+record. Stock (`HCU_VLLM_FP4_PACKER_IMPL=stock`, the default) or
+`HCU_DISABLE_OPS=vllm_fp4_packer` leaves every original object in place; a
+policy change needs a fresh process because JIT and Graph caches may already
+refer to the published kernel. A failure after publication is commit-fatal and
+is never presented as a rollback.
+
+Upstreaming position: the arithmetic body is a workaround for a toolchain gap,
+so the intended end state is deleting it once DTK lowers the PTX instruction or
+Core ships a lowering it can compile. This module therefore declares no
+upstream-format contribution; it carries no cache format, scale recipe or
+roofline claim of its own.
+
+Evidence level: **spec-consistent, hardware-unverified**. CPU/mock contracts
+only (83 tests): explicit E2M1 code literals, FP32 tie neighbours, saturation
+including `2**28`/`FLT_MAX`, NaN/Inf policy, nibble order, the audit gate, and
+policy/rollback refusals. The Triton kernel was neither compiled nor executed;
+native compilation, kernel hit, Graph replay, accuracy and performance remain
+separate gates.
+
 vLLM's native `SiluAndMul` remains the selected implementation. Warmed
 compiled A/B measurements on `gfx936` did not justify replacing the upstream
 operator, so the plugin neither registers nor ships a `SiluAndMul` override.
