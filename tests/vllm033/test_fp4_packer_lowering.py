@@ -300,11 +300,11 @@ def test_audit_accepts_comment_and_whitespace_changes() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 5. policy: default stock, kill switch wins, unsafe states refuse
+# 5. policy: explicit stock, kill switch wins, unsafe states refuse
 # ---------------------------------------------------------------------------
 
-def test_default_is_stock_with_no_capability(monkeypatch) -> None:
-    monkeypatch.delenv(packer.VARIABLE, raising=False)
+def test_explicit_stock_has_no_capability(monkeypatch) -> None:
+    monkeypatch.setenv(packer.VARIABLE, "stock")
     monkeypatch.delenv("HCU_DISABLE_OPS", raising=False)
     assert packer._mode() == "stock"
     assert packer.extension_spec().capabilities == frozenset()
@@ -337,7 +337,7 @@ def test_invalid_value_is_refused(monkeypatch) -> None:
 def test_stock_activation_is_a_no_op(monkeypatch) -> None:
     monkeypatch.setattr(packer, "_state", None, raising=False)
     monkeypatch.setattr(packer, "_failure", None, raising=False)
-    monkeypatch.delenv(packer.VARIABLE, raising=False)
+    monkeypatch.setenv(packer.VARIABLE, "stock")
     monkeypatch.delenv("HCU_DISABLE_OPS", raising=False)
     packer.activate_extension(ExtensionContext("0.1.0", "0.33.0"))
     assert packer._state == {"mode": "stock", "pid": __import__("os").getpid()}

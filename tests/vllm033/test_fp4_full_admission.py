@@ -36,8 +36,9 @@ def optin(monkeypatch):
     return config()
 
 
-def test_off_preserves_default_fp8(monkeypatch):
-    monkeypatch.delenv('HCU_VLLM_FP4_INDEXER_IMPL', raising=False)
+def test_explicit_stock_preserves_fp8(monkeypatch):
+    # Teacher Adapter now defaults to lightop; stock is the explicit FP8 arm.
+    monkeypatch.setenv('HCU_VLLM_FP4_INDEXER_IMPL', 'stock')
     monkeypatch.delenv('HCU_DISABLE_OPS', raising=False)
     assert not selected()
     assert validate_config(config()) is None

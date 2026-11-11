@@ -282,6 +282,19 @@ class HcuV41SparseAttnIndexer(SparseAttnIndexer):
                     or v['compress_ratio'] not in (1, 2) or v['head_dim'] != 128):
                 raise ValueError('FP4 owner requires source-owned FP4 K, ratio1/2, D128')
             super().__init__(*args, **kwargs)
+            from vllm import envs
+            from .fp4_workspace import query_chunk_rows
+            self.fp4_max_logits_bytes = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024**2
+            self.fp4_query_chunk_rows = query_chunk_rows(
+                self.max_model_len, self.fp4_max_logits_bytes)
+            # Profile runs outside the construction config scope in MRV2.
+            # Freeze capacity here rather than querying the current config later.
+            self.fp4_decode_rows = min(
+                cfg.scheduler_config.max_num_batched_tokens,
+                cfg.scheduler_config.max_num_seqs * (
+                    1 + (cfg.speculative_config.num_speculative_tokens
+                         if cfg.speculative_config else 0)))
+            self.fp4_page_records = cfg.cache_config.block_size // self.compress_ratio
             return
         if self._hcu_owned:
             import inspect

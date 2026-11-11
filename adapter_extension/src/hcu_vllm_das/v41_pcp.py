@@ -66,8 +66,13 @@ def validate_config(cfg) -> bool:
                 validate_engram_config(cfg)
             except ValueError as error:
                 errors.append(str(error))
-    if (cfg.attention_config.resolve_indexer_kv_dtype('fp8') != 'fp8'
-            or cfg.attention_config.indexer_sparse_logits):
+    from hcu_adapter.fp4_indexer import selected as fp4_selected, validate_config as validate_fp4
+    if fp4_selected():
+        # FP4 uses a different owned producer/cache/reader, while native PCP
+        # still prepares replicated K and local query metadata.
+        validate_fp4(cfg)
+    elif (cfg.attention_config.resolve_indexer_kv_dtype('fp8') != 'fp8'
+          or cfg.attention_config.indexer_sparse_logits):
         errors.append('source-owned FP8 indexer with dense logits required')
     if cfg.attention_config.backend not in (
         None, AttentionBackendEnum.ROCM_FLASHMLA_SPARSE_DSV4,

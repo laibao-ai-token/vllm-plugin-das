@@ -13,9 +13,9 @@ import inspect
 from importlib import import_module
 
 import torch
-from vllm.config import get_current_vllm_config
 from vllm.forward_context import get_forward_context
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadata
+from .fp4_workspace import workspace_bytes
 
 
 class Fp4Query(tuple):
@@ -229,14 +229,20 @@ def _validate(layer, meta, hidden, cache, query, weights):
 def execute(layer, hidden, query, weights):
     context = get_forward_context()
     if not isinstance(context.attn_metadata, dict):
-        # Profile the real dense logits bound without reading the empty cache.
-        from vllm.v1.worker.workspace import current_workspace_manager
-        cfg = get_current_vllm_config()
-        decode_rows = cfg.scheduler_config.max_num_seqs * (
-            1 + (cfg.speculative_config.num_speculative_tokens if cfg.speculative_config else 0))
-        rows = max(hidden.shape[0], decode_rows)
-        current_workspace_manager().get_simultaneous(
-            ((rows, (layer.max_model_len + 3) // 4 * 4), torch.float32))
+        # Match the explicit temporaries of the chunked real reader. Do not
+        # reserve a full prefill_rows x max_model_len dense matrix, or size
+        # decode staging from the prefill token count.
+        size = workspace_bytes(
+            query_rows=hidden.shape[0], decode_rows=layer.fp4_decode_rows,
+            max_model_len=layer.max_model_len, total_seq_lens=layer.max_total_seq_len,
+            topk_tokens=layer.topk_tokens, num_query_heads=32,
+            max_logits_bytes=layer.fp4_max_logits_bytes,
+            physical_page_size=layer.fp4_page_records)
+        # These allocations are transient in execute(), not consumers of the
+        # persistent WorkspaceManager. Keep the estimate transient too: Core
+        # memory_profiling records allocated_bytes.all.peak after it is freed.
+        temporary = torch.empty((size,), dtype=torch.uint8, device=hidden.device)
+        del temporary
         return layer.topk_indices_buffer
     from .v41_indexer import _select
     cache = cache_view(layer.k_cache.kv_cache)
@@ -263,15 +269,28 @@ def execute(layer, hidden, query, weights):
                 chunk.block_table[requests, local // page_records].long()
                 * page_records + local % page_records
             ).contiguous()
+            del positions, requests, local
             k, sf = p.gather(flat, slots, page_records)
-            logits = p.prefill((query.bf16[start:end].contiguous(), None), (k, sf),
-                               weights[start:end].contiguous(), chunk.cu_seqlen_ks,
-                               chunk.cu_seqlen_ke, False, width, None, None)
-            lengths = chunk.cu_seqlen_ke - chunk.cu_seqlen_ks
-            starts = torch.zeros_like(lengths)
-            _select(logits, starts, lengths, out[start:end],
-                    None if layer.candidate_blocks is None else layer.candidate_blocks[start:end],
-                    layer.candidate_block_size, layer.candidate_write)
+            del slots
+            for row_start in range(start, end, layer.fp4_query_chunk_rows):
+                row_end = min(end, row_start + layer.fp4_query_chunk_rows)
+                lo, hi = row_start - start, row_end - start
+                ks, ke = chunk.cu_seqlen_ks[lo:hi], chunk.cu_seqlen_ke[lo:hi]
+                logits = p.prefill(
+                    (query.bf16[row_start:row_end].contiguous(), None), (k, sf),
+                    weights[row_start:row_end].contiguous(), ks, ke,
+                    False, width, None, None)
+                # LightOp columns are relative to each query's K window.
+                lengths = ke - ks
+                starts = torch.zeros_like(lengths)
+                _select(logits, starts, lengths, out[row_start:row_end],
+                        None if layer.candidate_blocks is None
+                        else layer.candidate_blocks[row_start:row_end],
+                        layer.candidate_block_size, layer.candidate_write)
+                del logits, lengths, starts
+            # Also release the previous chunk's gather before the next gather
+            # or decode-staging allocation (assignment alone releases too late).
+            del k, sf
     if meta.num_decode_tokens:
         n = meta.num_decode_tokens
         d = meta.decode

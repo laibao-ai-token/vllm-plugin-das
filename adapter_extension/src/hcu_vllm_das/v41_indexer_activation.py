@@ -122,7 +122,8 @@ def activate_extension(context):
             import hashlib
             from pathlib import Path
             digest = hashlib.sha256()
-            for name in ('fp4_indexer.py', 'fp4_indexer_lightop.py', 'v41_indexer.py'):
+            for name in ('fp4_indexer.py', 'fp4_indexer_lightop.py',
+                         'fp4_workspace.py', 'v41_indexer.py'):
                 digest.update(Path(__file__).with_name(name).read_bytes())
             digest = digest.hexdigest()
         _publishing = True
