@@ -237,15 +237,15 @@ class Fp4Attention(rocm.DeepseekV41ROCMAiterMLAAttention, _Fp4CommonAttention):
 
     def _fused_qnorm_rope_kv_insert(self, q, kv, positions, attn_metadata):
         if (isinstance(attn_metadata, dict) and not self.use_pcp
-                and self.kv_mxfp8 and not self.accepts_unnormed_unroped_query
+                and not self.kv_mxfp8 and not self.accepts_unnormed_unroped_query
                 and self.n_local_heads == self.padded_heads == 64):
             swa = attn_metadata.get(self.swa_cache_layer.prefix)
             cache = self.swa_cache_layer.kv_cache
-            if (swa is not None and swa.block_size == 64
-                    and cache.dtype == torch.uint8 and cache.is_contiguous()
+            if (swa is not None and swa.block_size in (32, 64)
+                    and cache.dtype == torch.uint8
                     and cache.ndim > 0 and cache.shape[0] > 0
-                    and cache.numel() == cache.shape[0] * 64 * 528):
-                cache = cache.view(cache.shape[0], 64, 528)
+                    and cache.numel() == cache.shape[0] * swa.block_size * 584):
+                cache = cache.view(cache.shape[0], swa.block_size, 584)
                 cos_sin = self.rotary_emb.cos_sin_cache
                 if qkv_split_supported(q, kv, cache, swa.slot_mapping, positions, cos_sin):
                     return split_qkv(q, kv, cache, swa.slot_mapping, positions, cos_sin)

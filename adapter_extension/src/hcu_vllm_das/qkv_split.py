@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Keep native MXFP8 KV writes; avoid the fused Q/KV kernel's scratch traffic.
+"""Keep native fp8_ds_mla KV writes; avoid fused Q/KV scratch traffic.
 
 The verified gfx938 binary leaves the first even rotation in each 16-element
 lane group unfused. Its other even rotations and odd rotations use different
@@ -40,14 +40,18 @@ def supported(q, kv, cache, slots, positions, cos_sin):
             or q.ndim != 3 or q.shape[1:] != (64, 512)
             or not 0 < q.shape[0] <= 64
             or kv.shape != (q.shape[0], 512)
-            or cache.ndim != 3 or cache.shape[0] <= 0 or cache.shape[1:] != (64, 528)
+            or cache.ndim != 3 or cache.shape[0] <= 0
+            or cache.shape[1] not in (32, 64) or cache.shape[2] != 584
+            or cache.stride(2) != 1 or cache.stride(1) != 584
+            or cache.stride(0) < cache.shape[1] * 584
             or slots.ndim != 1 or slots.shape[0] > q.shape[0]
             or positions.shape != (q.shape[0],)
             or cos_sin.ndim != 2 or cos_sin.shape[0] <= 0 or cos_sin.shape[1] != 64
             or q.dtype != torch.bfloat16 or kv.dtype != torch.bfloat16
             or cache.dtype != torch.uint8 or cos_sin.dtype != torch.float32
             or slots.dtype != torch.int64 or positions.dtype != torch.int64
-            or not all(t.is_cuda and t.device == q.device and t.is_contiguous() for t in tensors)):
+            or not all(t.is_cuda and t.device == q.device for t in tensors)
+            or not all(t.is_contiguous() for t in (q, kv, slots, positions, cos_sin))):
         return False
     return getattr(torch.cuda.get_device_properties(q.device), 'gcnArchName', '').split(':')[0] == 'gfx938'
 
@@ -79,5 +83,5 @@ def split_qkv(q, kv, cache, slots, positions, cos_sin):
     _q_rope_native_512[(q.shape[0], 16)](
         q, positions, cos_sin, out, num_warps=4, enable_fp_fusion=False)
     torch.ops._C.fused_deepseek_v4_kv_rope_insert(
-        kv, cache, slots, positions, cos_sin, 64, None, True)
+        kv, cache, slots, positions, cos_sin, cache.shape[1], None, False)
     return out
