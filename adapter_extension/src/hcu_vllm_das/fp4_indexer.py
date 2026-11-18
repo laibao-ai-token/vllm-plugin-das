@@ -18,6 +18,7 @@ from vllm.v1.attention.backends.mla import indexer as metadata
 
 from . import fp4_packer, wo_a_layout
 from .fp4_indexer_lightop import Fp4Query, cache_view, load_providers, providers, rotate_bf16
+from .qkv_split import split_qkv, supported as qkv_split_supported
 
 
 # anchor-baseline(③): Core 5afd482929, 0.33.1.dev3, constructor globals are
@@ -233,3 +234,19 @@ class Fp4Attention(rocm.DeepseekV41ROCMAiterMLAAttention, _Fp4CommonAttention):
 
             return project(self.wq_b, qr, qr_scale, indexer=False)
         return super()._wq_b_proj(qr, qr_scale)
+
+    def _fused_qnorm_rope_kv_insert(self, q, kv, positions, attn_metadata):
+        if (isinstance(attn_metadata, dict) and not self.use_pcp
+                and self.kv_mxfp8 and not self.accepts_unnormed_unroped_query
+                and self.n_local_heads == self.padded_heads == 64):
+            swa = attn_metadata.get(self.swa_cache_layer.prefix)
+            cache = self.swa_cache_layer.kv_cache
+            if (swa is not None and swa.block_size == 64
+                    and cache.dtype == torch.uint8 and cache.is_contiguous()
+                    and cache.ndim > 0 and cache.shape[0] > 0
+                    and cache.numel() == cache.shape[0] * 64 * 528):
+                cache = cache.view(cache.shape[0], 64, 528)
+                cos_sin = self.rotary_emb.cos_sin_cache
+                if qkv_split_supported(q, kv, cache, swa.slot_mapping, positions, cos_sin):
+                    return split_qkv(q, kv, cache, swa.slot_mapping, positions, cos_sin)
+        return super()._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
