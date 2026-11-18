@@ -119,6 +119,13 @@ _INDEXER_INIT = _constructor('indexer', common.DeepseekV4Indexer.__init__,
 
 
 class Fp4Indexer(common.DeepseekV4Indexer):
+    def _wq_b_proj(self, qr, qr_scale=None):
+        if isinstance(qr, torch.Tensor) and qr.dtype == torch.int8:
+            from .int8_wq_b import project
+
+            return project(self.wq_b, qr, qr_scale, indexer=True)
+        return super()._wq_b_proj(qr, qr_scale)
+
     def __init__(self, *args, **kwargs):
         cfg = args[0] if args else kwargs['vllm_config']
         preflight(cfg)
@@ -175,5 +182,36 @@ class _Fp4CommonAttention(common.DeepseekV4Attention):
 class Fp4Attention(rocm.DeepseekV41ROCMAiterMLAAttention, _Fp4CommonAttention):
     # MRO routes native AMD super().__init__ to our private common constructor;
     # its post-init, attention/forward and loading stay native.
+    def __init__(self, *args, **kwargs):
+        from .environment import _flag
+
+        super().__init__(*args, **kwargs)
+        self._int8_wq_b_device = None
+        if _flag('VLLM_HCU_DSV41_INT8_WQ_B', default=False) and type(self.indexer) is Fp4Indexer:
+            from .int8_wq_b import configured_device
+
+            self._int8_wq_b_device = configured_device(self.indexer.vllm_config)
+
     def _indexer_cls(self, k_cache):
         return Fp4Indexer
+
+    def _split_qkv_and_norm(self, qr_kv):
+        qr, qr_scale, kv = super()._split_qkv_and_norm(qr_kv)
+        if (self._int8_wq_b_device is not None and type(self) is Fp4Attention
+                and type(self.indexer) is Fp4Indexer
+                and self._prepare_and_attn_fn == self._prepare_and_attn
+                and getattr(self.indexer.forward_q, '__func__', None) is Fp4Indexer.forward_q):
+            from .int8_wq_b import share
+
+            # FULL, reindex and serial prep already carry the pair over their
+            # own fork/join (or call) boundaries. It is never stored on a layer.
+            qr, qr_scale = share(self.indexer.vllm_config, self._int8_wq_b_device,
+                                 self, qr, qr_scale)
+        return qr, qr_scale, kv
+
+    def _wq_b_proj(self, qr, qr_scale=None):
+        if isinstance(qr, torch.Tensor) and qr.dtype == torch.int8:
+            from .int8_wq_b import project
+
+            return project(self.wq_b, qr, qr_scale, indexer=False)
+        return super()._wq_b_proj(qr, qr_scale)
