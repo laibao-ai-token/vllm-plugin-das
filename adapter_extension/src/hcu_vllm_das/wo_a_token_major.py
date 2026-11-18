@@ -77,14 +77,14 @@ def _token_major_bmm(torch, o, weight):
     return result
 
 
-def _wrap_o_proj(original, attention_cls, swa_cls, cached_weight, torch,
+def _wrap_o_proj(original, attention_classes, swa_cls, cached_weight, torch,
                  get_context, has_context, no_graph):
     @wraps(original)
     def project(self, attn_out, positions):
         # This exact AMD reference path gets BF16 rows after inverse RoPE.
         # QuantizedActivation, other backends, and alternate weight/row layouts
         # continue to use the original projection including its WO-B dispatch.
-        if (type(self) is not attention_cls or not isinstance(attn_out, torch.Tensor)
+        if (type(self) not in attention_classes or not isinstance(attn_out, torch.Tensor)
                 or attn_out.ndim != 3 or not 2 <= attn_out.shape[0] <= 32
                 or self.n_local_groups != 8 or self.o_lora_rank != 1024
                 or attn_out.shape[1] != self.n_local_heads
@@ -124,6 +124,16 @@ def _require_source(function, expected):
         raise RuntimeError(f"{_CAPABILITY} vLLM source differs: {function!r}")
 
 
+def _check_fp4_inheritance(attention, fp4_attention):
+    # Compare descriptors so a classmethod is checked against its actual owner.
+    methods = ("forward", "_alloc_attn_out", "get_padded_num_q_heads",
+               "forward_mqa", "_o_proj", "_wo_b_after_wo_a")
+    if (fp4_attention.__bases__[0] is not attention
+            or any(inspect.getattr_static(fp4_attention, name) is not
+                   inspect.getattr_static(attention, name) for name in methods)):
+        raise RuntimeError(f"{_CAPABILITY} FP4 attention inheritance changed")
+
+
 def _publish():
     import numpy as np
     import torch
@@ -160,11 +170,21 @@ def _publish():
             or "_o_proj" not in attention.__dict__
             or "prepare_attn" not in state.__dict__):
         raise RuntimeError(f"{_CAPABILITY} projection or metadata owner changed")
+    # The FP4 policy also selects the owned target at PCP1. Its registry
+    # entry is lazy, so resolve the same class here before patching the base.
+    from hcu_adapter.fp4_indexer import selected as fp4_selected
+
+    attention_classes = (attention,)
+    if fp4_selected():
+        from .fp4_indexer import Fp4Attention
+
+        _check_fp4_inheritance(attention, Fp4Attention)
+        attention_classes = (attention, Fp4Attention)
     prepare_wrapper = _wrap_prepare(
         prepare, state, swa, CompilationMode.NONE, CUDAGraphMode.NONE, np,
     )
     project_wrapper = _wrap_o_proj(
-        project, attention, swa, cached_weight, torch, get_forward_context,
+        project, attention_classes, swa, cached_weight, torch, get_forward_context,
         is_forward_context_available, CUDAGraphMode.NONE,
     )
     try:
@@ -172,14 +192,14 @@ def _publish():
         attention._o_proj = project_wrapper
     except BaseException as error:
         raise ExtensionCommitError(f"{_CAPABILITY} publication interrupted") from error
-    return state, prepare_wrapper, attention, project_wrapper
+    return state, prepare_wrapper, attention_classes, project_wrapper
 
 
 def _check_health():
     if _publication is not None:
-        state, prepare, attention, project = _publication
+        state, prepare, attention_classes, project = _publication
         if (not _flag(_SWITCH, default=False) or state.prepare_attn is not prepare
-                or attention._o_proj is not project):
+                or any(cls._o_proj is not project for cls in attention_classes)):
             raise ExtensionCommitError(f"{_CAPABILITY} policy or binding changed; restart")
 
 

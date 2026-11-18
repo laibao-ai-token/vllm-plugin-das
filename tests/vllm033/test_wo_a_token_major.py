@@ -44,6 +44,7 @@ def test_default_off(monkeypatch):
 
 @pytest.mark.parametrize('scenario', [
     'decode', 'short extend', 'mixed', 'dummy', 'missing phase', 'incomplete', 'padded',
+    'padded requests', '48-row verify',
     'full', 'piecewise', 'capture', 'not enforce eager', 'compile',
     'dbatch', 'unsupported state', 'pcp',
 ])
@@ -63,6 +64,13 @@ def test_phase_is_independent_of_swa_counters(scenario):
         batch.num_computed_prefill_tokens_np[:] = [1, 3]
     elif scenario == 'padded':
         batch.num_tokens_after_padding = 8
+    elif scenario == 'padded requests':
+        batch.num_reqs_after_padding = 4
+    elif scenario == '48-row verify':
+        batch.num_tokens = batch.num_tokens_after_padding = swa.num_decode_tokens = 48
+        batch.num_reqs = batch.num_reqs_after_padding = swa.num_decodes = 8
+        batch.is_prefilling_np = np.zeros(8, dtype=np.bool_)
+        batch.prefill_len_np = batch.num_computed_prefill_tokens_np = np.full(8, 4096)
     elif scenario == 'full':
         mode = FULL
     elif scenario == 'piecewise':
@@ -123,8 +131,28 @@ class Attention:
         return flattened
 
 
+class CommonAttention:
+    pass
+
+
+class Fp4Attention(Attention, CommonAttention):
+    """Mirror the owned target's multiple inheritance without importing vLLM."""
+
+
+def test_fp4_inherits_native_projection_contract(monkeypatch):
+    for method in ('forward', '_alloc_attn_out', 'forward_mqa', '_o_proj'):
+        monkeypatch.setattr(Attention, method, lambda self: None, raising=False)
+    monkeypatch.setattr(Attention, 'get_padded_num_q_heads',
+                        classmethod(lambda cls, heads: heads), raising=False)
+    wo._check_fp4_inheritance(Attention, Fp4Attention)
+    monkeypatch.setattr(Fp4Attention, 'forward_mqa', lambda self: None)
+    with pytest.raises(RuntimeError, match='FP4 attention inheritance changed'):
+        wo._check_fp4_inheritance(Attention, Fp4Attention)
+
+
 @pytest.mark.parametrize('scenario', [
-    'eligible', 'full', 'piecewise', 'unmarked', 'different rows', 'capture',
+    'eligible', 'eligible base', 'foreign subclass', 'fp4 subclass',
+    'full', 'piecewise', 'unmarked', 'different rows', 'capture',
     'compile', 'quantized', 'noncontiguous', 'noncontiguous weight', 'other device',
     'too many rows', 'one row', 'missing context',
 ])
@@ -150,11 +178,17 @@ def test_exact_route_and_wo_b_dispatch(scenario):
                        is_current_stream_capturing=lambda: scenario == 'capture'),
                empty=lambda shape, **_: Tensor(shape), no_grad=nullcontext, bmm=Mock())
     original = Mock(return_value='stock')
-    project = wo._wrap_o_proj(original, Attention, SWA, lambda *_: weight, torch,
-                             lambda: context, lambda: scenario != 'missing context', NONE)
-    o_proj = Attention()
+    project = wo._wrap_o_proj(original, (Attention, Fp4Attention), SWA, lambda *_: weight,
+                              torch, lambda: context,
+                              lambda: scenario != 'missing context', NONE)
+    attention_cls = {
+        'eligible base': Attention,
+        'foreign subclass': type('OtherAttention', (Attention,), {}),
+        'fp4 subclass': type('DerivedFp4Attention', (Fp4Attention,), {}),
+    }.get(scenario, Fp4Attention)
+    o_proj = attention_cls()
     result = project(o_proj, out, 'positions')
-    if scenario == 'eligible':
+    if scenario in ('eligible', 'eligible base'):
         assert result == 'token-major WO-B input'
         original.assert_not_called()
         torch.bmm.assert_called_once()
