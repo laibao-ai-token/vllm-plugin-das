@@ -187,7 +187,7 @@ class Fp4Attention(rocm.DeepseekV41ROCMAiterMLAAttention, _Fp4CommonAttention):
 
         super().__init__(*args, **kwargs)
         self._int8_wq_b_device = None
-        if _flag('VLLM_HCU_DSV41_INT8_WQ_B', default=False) and type(self.indexer) is Fp4Indexer:
+        if _flag('VLLM_HCU_DSV41_INT8_WQ_B', default=True) and type(self.indexer) is Fp4Indexer:
             from .int8_wq_b import configured_device
 
             self._int8_wq_b_device = configured_device(self.indexer.vllm_config)

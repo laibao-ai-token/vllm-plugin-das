@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Opt-in BF16 G8 WO-A layout candidate for the vLLM 0.33 HCU reference path."""
+"""BF16 G8 WO-A layout for the validated vLLM 0.33 HCU eager path."""
 
-from functools import wraps
+from functools import lru_cache, wraps
 from hashlib import sha256
 import inspect
 from logging import getLogger
+import os
 from threading import RLock
 
 from hcu_adapter.extensions import ExtensionCommitError, ExtensionSpec
@@ -17,6 +18,22 @@ _PHASE_ROWS = "_das_wo_a_eager_decode_rows"
 _LOCK = RLock()
 _publication = None
 _log = getLogger(__name__)
+
+
+@lru_cache(maxsize=1)
+def _supported_default():
+    from hcu_adapter.bridges.vllm import _installed_vllm_version, detect_hcu
+
+    if _installed_vllm_version() != '0.33.0+dtk2610.torch2130.2611101131.g7364da':
+        return False
+    detected = detect_hcu()
+    return detected.detected and detected.architecture == 'gfx938'
+
+
+def _enabled():
+    if _SWITCH in os.environ:
+        return _flag(_SWITCH, default=False)
+    return _supported_default()
 
 
 def _phase_rows(batch, np):
@@ -198,7 +215,7 @@ def _publish():
 def _check_health():
     if _publication is not None:
         state, prepare, attention_classes, project = _publication
-        if (not _flag(_SWITCH, default=False) or state.prepare_attn is not prepare
+        if (not _enabled() or state.prepare_attn is not prepare
                 or any(cls._o_proj is not project for cls in attention_classes)):
             raise ExtensionCommitError(f"{_CAPABILITY} policy or binding changed; restart")
 
@@ -207,7 +224,7 @@ def _activate(context):
     global _publication
     with _LOCK:
         _check_health()
-        if _publication is None and _flag(_SWITCH, default=False):
+        if _publication is None and _enabled():
             from .extension import _require_vllm_033_release_line
 
             _require_vllm_033_release_line(context.vllm_version)
@@ -216,8 +233,8 @@ def _activate(context):
 
 
 def extension_spec():
-    """Discover without torch/vLLM imports, including when the opt-in is off."""
-    enabled = _flag(_SWITCH, default=False)
+    """Advertise WO-A when enabled on this process's startup stack."""
+    enabled = _enabled()
     return ExtensionSpec(
         name=_CAPABILITY, api_version=1, priority=95,
         capabilities=frozenset({_CAPABILITY}) if enabled else frozenset(),

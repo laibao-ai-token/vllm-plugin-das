@@ -138,7 +138,7 @@ def route(monkeypatch):
          vars(env))
     monkeypatch.setitem(sys.modules, env.__name__, env)
     env_key = 'VLLM_HCU_DSV41_INT8_WQ_B'
-    monkeypatch.setenv(env_key, '1')
+    monkeypatch.delenv(env_key, raising=False)
 
     seen = []
     native_qr_scale = NS(value=None)
@@ -232,7 +232,7 @@ def test_ineligible_pair_stays_native(route, monkeypatch, mismatch):
     r = route
     main, index = r.attn.wq_b, r.attn.indexer.wq_b
     if mismatch == 'off':
-        monkeypatch.delenv(r.env_key)
+        monkeypatch.setenv(r.env_key, '0')
     elif mismatch == 'eager':
         r.torch.cuda.is_current_stream_capturing.return_value = False
     elif mismatch == 'compile':

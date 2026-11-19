@@ -72,6 +72,15 @@ operator, so the plugin neither registers nor ships a `SiluAndMul` override.
 No model, topology, FP8-KV, or broad performance support is implied by these
 operator-level capabilities.
 
+## DSV4.1 HCU decode defaults
+
+On the validated gfx938 vLLM 0.33 build (`g7364da`),
+`HCU_VLLM_WO_A_TOKEN_MAJOR` defaults to enabled. It applies to eligible
+BF16 eager decode batches of 2–32 rows. The owned MXFP4 attention path
+also enables `VLLM_HCU_DSV41_INT8_WQ_B` by default, subject to the existing
+FULL capture, quantization and tensor layout checks. Set either variable to
+`0` before starting the server to disable its optimization.
+
 ## DSV4.1 Channel-FP8 configuration routing
 
 The independent `das_hcu_dsv41` Adapter extension advertises only

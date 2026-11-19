@@ -32,14 +32,33 @@ def _batch():
               num_computed_prefill_tokens_np=np.array([2, 3]))
 
 
-def test_default_off(monkeypatch):
+@pytest.mark.parametrize(('supported', 'override', 'expected'), [
+    (True, None, True), (False, None, False), (True, '0', False), (False, '1', True),
+])
+def test_startup_policy(monkeypatch, supported, override, expected):
     monkeypatch.delenv(wo._SWITCH, raising=False)
+    if override is not None:
+        monkeypatch.setenv(wo._SWITCH, override)
+    monkeypatch.setattr(wo, '_supported_default', lambda: supported)
+    monkeypatch.setattr(wo, '_publication', None)
     publish = Mock()
     monkeypatch.setattr(wo, '_publish', publish)
     spec = wo.extension_spec()
-    assert not spec.capabilities
+    assert (wo._CAPABILITY in spec.capabilities) is expected
     spec.activate(NS(vllm_version='0.33.0'))
-    publish.assert_not_called()
+    assert publish.call_count == int(expected)
+
+
+@pytest.mark.parametrize(('pinned', 'arch', 'expected'), [
+    (True, 'gfx938', True), (True, 'gfx936', False), (False, 'gfx938', False),
+])
+def test_default_stack(monkeypatch, pinned, arch, expected):
+    from hcu_adapter.bridges import vllm
+
+    monkeypatch.setattr(vllm, '_installed_vllm_version', lambda: (
+        '0.33.0+dtk2610.torch2130.2611101131.g7364da' if pinned else '0.33.0'))
+    monkeypatch.setattr(vllm, 'detect_hcu', lambda: NS(detected=True, architecture=arch))
+    assert wo._supported_default.__wrapped__() is expected
 
 
 @pytest.mark.parametrize('scenario', [
