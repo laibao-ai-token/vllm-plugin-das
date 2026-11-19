@@ -63,9 +63,15 @@ def configured(config):
     if not _SOURCE_MATCHES or not isinstance(config.quant_config, HcuDSV41CTW4A8Config):
         return False
     parallel = config.parallel_config
-    model = config.model_config.hf_config
+    mc = config.model_config
+    outer = mc.hf_config
+    model = getattr(mc, 'hf_text_config', None)
+    if model is None:
+        model = getattr(outer, 'text_config', outer)
     return (_cache_contract(native._get_cached_wo_a_bf16)[0]
-            and model.model_type == 'deepseek_v41' and model.hidden_size == 5120
+            and getattr(outer, 'model_type', None) in ('deepseek_v41', 'deepseek_v41_text')
+            and getattr(model, 'model_type', None) in ('deepseek_v41', 'deepseek_v41_text')
+            and getattr(model, 'hidden_size', None) == 5120
             and parallel.pipeline_parallel_size == 1
             and parallel.tensor_parallel_size == parallel.prefill_context_parallel_size == 1
             and parallel.data_parallel_size == 8 and parallel.enable_expert_parallel)
