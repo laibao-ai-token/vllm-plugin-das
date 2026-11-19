@@ -5,6 +5,7 @@ from __future__ import annotations
 from functools import lru_cache
 import hashlib
 import inspect
+import logging
 from types import FunctionType
 
 KEY = "hcu_dsv41_dspark_final_post"
@@ -88,3 +89,5 @@ def initialize_owned(model, *, vllm_config, prefix):
     if any(getattr(owner, name) is not original for owner, name, original in anchors):
         raise RuntimeError("Owned DSpark native implementation identity changed")
     constructor(model, vllm_config=vllm_config, prefix=prefix)
+    logging.getLogger("vllm." + __name__).info(
+        "HCU W4A8 private draft final Post constructor admitted: H=5120 HC=4")
