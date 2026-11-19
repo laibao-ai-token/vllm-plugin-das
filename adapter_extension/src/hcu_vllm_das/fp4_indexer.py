@@ -16,7 +16,7 @@ from vllm.models.deepseek_v41.amd import rocm
 from vllm.models.deepseek_v41.common.ops import indexer_k_store as store
 from vllm.v1.attention.backends.mla import indexer as metadata
 
-from . import fp4_packer
+from . import fp4_packer, wo_a_layout
 from .fp4_indexer_lightop import Fp4Query, cache_view, load_providers, providers, rotate_bf16
 
 
@@ -181,22 +181,28 @@ class _Fp4CommonAttention(common.DeepseekV4Attention):
 
 class Fp4Attention(rocm.DeepseekV41ROCMAiterMLAAttention, _Fp4CommonAttention):
     # MRO routes native AMD super().__init__ to our private common constructor;
-    # its post-init, attention/forward and loading stay native.
+    # Its post-init, attention/forward and loading stay native.
     def __init__(self, *args, **kwargs):
         from .environment import _flag
 
+        cfg = args[0] if args else kwargs['vllm_config']
         super().__init__(*args, **kwargs)
+        self._hcu_wo_a_layout = wo_a_layout.configured(cfg)
         self._int8_wq_b_device = None
         self._int8_wq_b_direct = None
         if type(self) is Fp4Attention and _flag('HCU_DSV41_WQ_B_INT8_DIRECT', default=False):
             from .int8_wq_b import configure_direct_gemm
 
-            cfg = args[0] if args else kwargs['vllm_config']
             self._int8_wq_b_direct = configure_direct_gemm(cfg)
         if _flag('VLLM_HCU_DSV41_INT8_WQ_B', default=True) and type(self.indexer) is Fp4Indexer:
             from .int8_wq_b import configured_device
 
             self._int8_wq_b_device = configured_device(self.indexer.vllm_config)
+
+    def _o_proj(self, attn_out, positions):
+        if self._hcu_wo_a_layout and wo_a_layout.supported(self, attn_out):
+            return self._wo_b_after_wo_a(wo_a_layout.project(self, attn_out))
+        return super()._o_proj(attn_out, positions)
 
     def _indexer_cls(self, k_cache):
         return Fp4Indexer
