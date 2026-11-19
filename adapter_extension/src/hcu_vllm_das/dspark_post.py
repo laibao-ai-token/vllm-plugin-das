@@ -55,12 +55,18 @@ def _clone(owner, name, expected, substitutions):
 @lru_cache(maxsize=1)
 def implementation():
     from hcu_adapter.kernels import mhc_post_5120_triton as post
+    from hcu_adapter.kill_switch import op_disabled
     from vllm.models.deepseek_v41.amd import dspark as native
 
+    original_post = native.mhc_post_torch
+    if hashlib.sha256(inspect.getsource(original_post).encode()).hexdigest() != (
+            "24f96f096ebd6c6ea2a5b902402f90321c8d4489cb0ab6a351823d6eb86c9b7a"):
+        raise RuntimeError("Owned DSpark native source changed: mhc_post_torch")
+
     def final_post(x, residual, post_mix, comb):
-        if post.supported(x, residual, post_mix, comb):
+        if not op_disabled('vllm_mhc') and post.supported(x, residual, post_mix, comb):
             return post.post_5120(x, residual, post_mix, comb)
-        return native.mhc_post_torch(x, residual, post_mix, comb)
+        return original_post(x, residual, post_mix, comb)
 
     forward, forward_anchor = _clone(native.DSparkDeepseekV4Model, "forward",
         "4fae143677e054b267a5861db30277df79b51608cca8c5b4540220e63746fd01",
@@ -73,7 +79,8 @@ def implementation():
     outer, outer_anchor = _clone(native.DSparkDeepseekV4ForCausalLM, "__init__",
         "8f63625682361086e3df60598866076e0aefb657a200c03fbc7725b07ddb299f",
         {"DSparkDeepseekV4Model": DraftModel})
-    return DraftModel, outer, (forward_anchor, outer_anchor)
+    return DraftModel, outer, (forward_anchor, outer_anchor,
+                               (native, "mhc_post_torch", original_post))
 
 
 def initialize_owned(model, *, vllm_config, prefix):
