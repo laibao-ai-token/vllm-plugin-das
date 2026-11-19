@@ -33,6 +33,8 @@ active and healthy. Configurations outside FP4 admission retain Core's FP8
 default. Explicit `fp8` selects FP8. Explicit `mxfp4` retains strict admission.
 Selecting a stock indexer or packer, disabling either provider, or running with
 an earlier compatible Adapter preserves the FP8 default for `auto`.
+The LightOp FP4 decode path masks logits beyond each device sequence length
+before candidate selection and top-k, including during CUDA Graph replay.
 
 ## E2M1 packer lowering (default triton, `stock` opts out)
 

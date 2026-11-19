@@ -412,6 +412,10 @@ def execute(layer, hidden, query, weights):
                           decode_cache.unsqueeze(2), weights[:n].contiguous(),
                           lengths, decode_table.contiguous(),
                           None, width, 64, None, 1)
+        # The provider can leave the decode logits tail unwritten. Mask it
+        # before candidate selection and top-k, using device lengths on replay.
+        columns = torch.arange(logits.shape[1], dtype=lengths.dtype, device=logits.device)
+        logits.masked_fill_(columns[None, :] >= lengths[:, None], -float('inf'))
         _select(logits, torch.zeros_like(lengths), lengths, out[:n],
                 None if layer.candidate_blocks is None else layer.candidate_blocks[:n],
                 layer.candidate_block_size, layer.candidate_write)
