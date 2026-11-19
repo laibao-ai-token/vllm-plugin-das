@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Explicit W4A8 draft LL experiment; AG/RS remains the default."""
+"""Default to the admitted W4A8 draft LL path, with an explicit AG/RS opt-out."""
 
 KEY = "hcu_dsv41_dspark_draft_backend"
 
@@ -7,15 +7,26 @@ KEY = "hcu_dsv41_dspark_draft_backend"
 def native_draft_ll_requested(config):
     extra = getattr(config, "additional_config", None)
     if extra is None:
-        return False
+        extra = {}
     if not isinstance(extra, dict):
         raise ValueError("DSpark additional_config must be a dict")
-    backend = extra.get(KEY, "allgather_reducescatter")
+    explicit = KEY in extra
+    backend = extra.get(KEY, "deepep_low_latency")
     if backend == "allgather_reducescatter":
         return False
     if backend != "deepep_low_latency":
         raise ValueError("Unsupported HCU DSpark draft backend: " + str(backend))
+    if not explicit:
+        # Other models and deployment geometries retain the native AG/RS
+        # policy. Explicit requests keep the strict diagnostic error path.
+        try:
+            return _validate(config)
+        except (AttributeError, ValueError):
+            return False
+    return _validate(config)
 
+
+def _validate(config):
     from .dspark_agrs import _owned_quant_kind, draft_config, is_owned_draft
     from .dspark_graph import native_decode_dspark
 
