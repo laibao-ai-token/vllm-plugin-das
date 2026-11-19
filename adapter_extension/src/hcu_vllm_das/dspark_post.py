@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Optional native draft final Post schedule, with private source-pinned globals."""
+"""Admit the verified draft Post by default; retain an explicit opt-out."""
 from __future__ import annotations
 
 from functools import lru_cache
@@ -13,10 +13,29 @@ KEY = "hcu_dsv41_dspark_final_post"
 
 def requested(config):
     extra = getattr(config, "additional_config", None)
-    if not isinstance(extra, dict) or extra.get(KEY, False) is False:
+    if extra is None:
+        extra = {}
+    if not isinstance(extra, dict):
+        raise ValueError("DSpark additional_config must be a dict")
+    explicit = KEY in extra
+    value = extra.get(KEY, True)
+    if value is False:
         return False
-    if extra[KEY] is not True:
+    if value is not True:
         raise ValueError("W4A8 draft final Post must be an explicit boolean")
+    if not explicit:
+        # Default admission must not resolve private native bodies for other
+        # models/topologies. An explicit request retains the strict error path.
+        if getattr(config, "quant_config", None) is None:
+            return False
+        try:
+            return _validate(config)
+        except (AttributeError, ValueError):
+            return False
+    return _validate(config)
+
+
+def _validate(config):
     from .dspark_agrs import _owned_quant_kind, is_owned_draft, draft_config
     from .dspark_graph import native_decode_dspark
     owned = is_owned_draft(config)
