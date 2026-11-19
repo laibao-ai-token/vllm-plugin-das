@@ -24,7 +24,17 @@ and retains a Plugin E5M2 writer and descale adapter. The kernel page is 64
 tokens. It neither copies nor replaces the official Flash forward method and
 does not require private HCU hooks in the Core.
 
-## E2M1 packer lowering (opt-in, default stock)
+## V4.1 indexer cache default
+
+With the paired Adapter policy, HCU platform configuration resolves
+`indexer_kv_dtype=auto` to `mxfp4` before model and cache construction when
+FP4 admission succeeds and the indexer and Triton packer extensions are
+active and healthy. Configurations outside FP4 admission retain Core's FP8
+default. Explicit `fp8` selects FP8. Explicit `mxfp4` retains strict admission.
+Selecting a stock indexer or packer, disabling either provider, or running with
+an earlier compatible Adapter preserves the FP8 default for `auto`.
+
+## E2M1 packer lowering (default triton, `stock` opts out)
 
 `das_hcu_fp4_packer` rebinds Core's `_fp32x2_to_fp4x2` E2M1 packer at startup.
 The audited upstream body emits PTX `cvt.rn.satfinite.e2m1x2.f32` with the
