@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import hashlib
 import inspect
+from functools import partial
 from importlib.metadata import PackageNotFoundError, version
 
 import torch
@@ -101,10 +102,10 @@ def _registered_ops():
         return False
 
 
-def configured_device(cfg):
+def configured_device(cfg, *, eager=False):
     """Resolve per-attention startup policy before forwards and graph capture."""
     p = cfg.parallel_config
-    if (not cfg.use_v2_model_runner or cfg.model_config.enforce_eager
+    if (not cfg.use_v2_model_runner or cfg.model_config.enforce_eager != eager
             or p.tensor_parallel_size != 1 or p.prefill_context_parallel_size != 1
             or p.decode_context_parallel_size != 1 or p.use_ubatching
             or not torch.version.hip or not current_platform.is_rocm()
@@ -215,6 +216,95 @@ def share(cfg, device, attention, qr, qr_scale):
     if azp is not None or not _valid_pair(payload, scale) or payload.shape != qr.shape:
         raise RuntimeError('INT8 WQ-B native dynamic quant returned an invalid operand')
     return payload, scale
+
+
+def configure_direct_gemm(cfg):
+    """Resolve the opt-in legacy GEMM once during eager attention construction."""
+    device = configured_device(cfg, eager=True)
+    if device is None:
+        return None
+    try:
+        from lightop.gemm_ops import hipblaslt_w8a8_gemm
+
+        expected = ('a', 'b', 'scale_a', 'scale_b', 'm', 'n', 'k',
+                    'transpose_flag', 'out_dtype', 'bias')
+        if tuple(inspect.signature(hipblaslt_w8a8_gemm).parameters) == expected:
+            return device, hipblaslt_w8a8_gemm
+    except (ImportError, AttributeError, ValueError, TypeError):
+        pass
+    _LOG.warning_once('Eager INT8 WQ-B direct GEMM unavailable: unsupported LightOp API')
+    return None
+
+
+def project_eager_direct(binding, layer, qr, qr_scale):
+    """Reproduce native CT quantization and invoke the legacy LightOp GEMM."""
+    device, gemm = binding
+    if (qr_scale is not None or not isinstance(qr, torch.Tensor)
+            or qr.dtype != torch.bfloat16 or not qr.is_cuda or qr.device.index != device
+            or qr.ndim != 2 or not 1 <= qr.shape[0] <= 256 or qr.shape[1] != _K
+            or torch.compiler.is_compiling() or torch.cuda.is_current_stream_capturing()
+            or not _layer_matches(layer, qr.device, indexer=False)):
+        return None
+    return _direct_gemm(gemm, layer, qr, _K, _MAIN_N)
+
+
+def _direct_gemm(gemm, layer, x, k, n):
+    payload, scale, azp = ops.scaled_int8_quant(x.contiguous(), None, None, symmetric=True)
+    rows = x.shape[0]
+    if (azp is not None or payload.shape != x.shape or payload.dtype != torch.int8
+            or payload.device != x.device or not payload.is_contiguous()
+            or scale.shape != (rows, 1) or scale.dtype != torch.float32
+            or scale.device != x.device or not scale.is_contiguous()):
+        raise RuntimeError('Eager INT8 quantization returned an invalid operand')
+    status, out = gemm(payload, layer.weight.t(), scale, layer.weight_scale,
+                       rows, n, k, 'NT', x.dtype)
+    if (status is not True or not isinstance(out, torch.Tensor)
+            or out.shape != (rows, n) or out.dtype != x.dtype or out.device != x.device):
+        raise RuntimeError('Eager INT8 direct GEMM returned an invalid result')
+    return out
+
+
+def bind_decoder_direct_gemm(binding, attention, moe):
+    """Attach the eager route to the three audited CT kernel instances."""
+    if binding is None:
+        return
+    shared = moe.shared_experts
+    gate_up = getattr(shared, 'gate_up_proj', None)
+    for layer, k, n in ((attention.fused_wqa_wkv, 5120, 1792),
+                        (attention.wo_b, 8192, 5120), (gate_up, 5120, 4608)):
+        if (layer is None or type(layer.quant_method) is not HcuDSV41Int8LinearMethod
+                or layer.tp_size != 1 or layer.bias is not None):
+            continue
+        scheme = layer.scheme
+        if type(scheme) is not CompressedTensorsW8A8Int8:
+            continue
+        kernel = scheme.kernel
+        cls = triton.TritonInt8ScaledMMLinearKernel
+        if (type(kernel) is cls and kernel.config.is_channelwise
+                and not kernel.config.is_static_input_scheme and kernel.config.input_symmetric
+                and getattr(kernel.apply_weights, '__func__', None) is cls.apply_weights):
+            kernel.apply_weights = partial(_apply_decoder_direct, kernel.apply_weights,
+                                           binding, k, n, layer)
+
+
+def _apply_decoder_direct(original, binding, k, n, owner, layer, x, bias=None):
+    device, gemm = binding
+    if (layer is owner and bias is None and isinstance(x, torch.Tensor)
+            and x.dtype == torch.bfloat16 and x.is_cuda and x.device.index == device
+            and x.ndim == 2 and 1 <= x.shape[0] <= 256 and x.shape[1] == k
+            and not torch.compiler.is_compiling() and not torch.cuda.is_current_stream_capturing()):
+        weight, scale = layer.weight, layer.weight_scale
+        witness = getattr(layer, '_hcu_int8_empty_witness', None)
+        if (getattr(layer, '_hcu_int8_empty_state', None) == 'ready' and witness is not None
+                and witness.scheme is layer.scheme and witness.kernel is layer.scheme.kernel
+                and witness.weight is weight and weight.dtype == torch.int8
+                and weight.device == scale.device == x.device and weight.shape == (k, n)
+                and weight.stride() == (1, k) and scale.dtype == torch.float32
+                and scale.shape in ((n,), (n, 1)) and scale.is_contiguous()
+                and layer.input_scale is None and layer.input_zero_point is None
+                and layer.azp_adj is None):
+            return _direct_gemm(gemm, layer, x, k, n)
+    return original(layer, x, bias)
 
 
 def project(layer, qr, qr_scale, *, indexer):

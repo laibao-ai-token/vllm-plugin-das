@@ -187,6 +187,12 @@ class Fp4Attention(rocm.DeepseekV41ROCMAiterMLAAttention, _Fp4CommonAttention):
 
         super().__init__(*args, **kwargs)
         self._int8_wq_b_device = None
+        self._int8_wq_b_direct = None
+        if type(self) is Fp4Attention and _flag('HCU_DSV41_WQ_B_INT8_DIRECT', default=False):
+            from .int8_wq_b import configure_direct_gemm
+
+            cfg = args[0] if args else kwargs['vllm_config']
+            self._int8_wq_b_direct = configure_direct_gemm(cfg)
         if _flag('VLLM_HCU_DSV41_INT8_WQ_B', default=True) and type(self.indexer) is Fp4Indexer:
             from .int8_wq_b import configured_device
 
@@ -210,6 +216,12 @@ class Fp4Attention(rocm.DeepseekV41ROCMAiterMLAAttention, _Fp4CommonAttention):
         return qr, qr_scale, kv
 
     def _wq_b_proj(self, qr, qr_scale=None):
+        if self._int8_wq_b_direct is not None:
+            from .int8_wq_b import project_eager_direct
+
+            out = project_eager_direct(self._int8_wq_b_direct, self.wq_b, qr, qr_scale)
+            if out is not None:
+                return out
         if isinstance(qr, torch.Tensor) and qr.dtype == torch.int8:
             from .int8_wq_b import project
 
