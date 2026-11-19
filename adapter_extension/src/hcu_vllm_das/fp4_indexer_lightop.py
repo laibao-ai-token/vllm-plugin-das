@@ -260,6 +260,16 @@ def stage_decode_pages(cache, block_table, row_ends, max_context_len, gather):
         raise ValueError('FP4 staging row/table count mismatch')
     if block_table.shape[1] < (width + page_records - 1) // page_records:
         raise ValueError('FP4 staging block table is too narrow for requested context')
+    # Native provider identity keeps injected gather collaborators observable.
+    # CPU/unsupported hardware retains the original gather and repack path.
+    if cache.is_cuda and _providers is not None and gather is _providers.gather:
+        from hcu_adapter.kernels.fp4_staging_triton import stage_decode_pages as stage
+        pages = _staging_target(cache, requests, pages_per_row)
+        table = torch.empty((requests, pages_per_row), dtype=torch.int32, device=cache.device)
+        if stage(cache, block_table, row_ends, pages, table):
+            flat_pool = pages.reshape(requests * pages_per_row, STAGING_PAGE_BYTES)
+            pool = flat_pool.as_strided((flat_pool.shape[0], 64, 68), (4352, 68, 1))
+            return pool, table
     offsets = torch.arange(width, device=cache.device, dtype=torch.int64)
     valid = offsets[None, :] < row_ends.reshape(-1, 1)
     logical_pages = torch.div(offsets, page_records, rounding_mode='floor')
