@@ -3,6 +3,7 @@
 from __future__ import annotations
 from functools import lru_cache
 import inspect
+import os
 from types import SimpleNamespace
 import torch
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
@@ -13,6 +14,7 @@ from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import TopKWeig
 from vllm.model_executor.layers.fused_moe.utils import _resize_cache
 from vllm.model_executor.layers.quantization.utils.quant_utils import kInt4W4A8StaticChannelSym, kInt8DynamicTokenSym
 from vllm.platforms import current_platform
+from .ct_w4a8_hints import expected_m
 from .ct_w4a8_prepare import HcuCTHTPrepareAndFinalize,HcuCTLLPrepareAndFinalize,DeepEPHTPrepareAndFinalize,DeepEPLLPrepareAndFinalize
 
 
@@ -159,6 +161,16 @@ class HcuCTMaskedExperts(_Experts):
     def __init__(self,moe,quant,weights,ops,capacity,dispatchers):
         super().__init__(moe,quant,max_num_tokens=capacity,num_dispatchers=dispatchers)
         self.weights=weights;self.ops=ops
+        self._small_batch_hint = False
+        if (os.getenv('HCU_DSV41_W4A8_MOE_EXPECTED_M') == '1'
+                and capacity == 256 and dispatchers == 8
+                and tuple(self.w1_scale.shape[:2]) == (48, 4608)
+                and tuple(self.w2_scale.shape[:2]) == (48, 5120)
+                and quant.gemm1_clamp_limit == 10
+                and weights[0].device.type == 'cuda'):
+            props = torch.cuda.get_device_properties(weights[0].device)
+            arch = getattr(props, 'gcnArchName', '').split(':', 1)[0]
+            self._small_batch_hint = arch == 'gfx938' and props.multi_processor_count == 64
     @staticmethod
     def activation_format(): return mk.FusedMoEActivationFormat.BatchedExperts
     def finalize_weight_and_reduce_impl(self): return TopKWeightAndReduceDelegate()
@@ -173,14 +185,19 @@ class HcuCTMaskedExperts(_Experts):
         e,t,n,k,_=self.moe_problem_size(hidden_states,w1,w2,topk_ids)
         if t!=self.max_num_tokens*self.num_dispatchers: raise ValueError('LL input exceeds expert workspace contract')
         counts=expert_tokens_meta.expert_num_tokens
+        # The hint selects kernels. Device counts still bound every expert's rows.
+        hint = t
+        if self._small_batch_hint and global_num_experts == 384 and topk_ids.shape[1] == 6:
+            hint = expected_m(topk_ids.shape[0], self.num_dispatchers, 6,
+                              global_num_experts, t)
         gateup=_resize_cache(workspace13,(e,t,n))
-        self.ops.gemm_masked((hidden_states,a1q_scale),(self.weights[0],self.w1_scale),gateup,counts,t)
+        self.ops.gemm_masked((hidden_states,a1q_scale),(self.weights[0],self.w1_scale),gateup,counts,hint)
         limit=self.quant_config.gemm1_clamp_limit
         if limit is not None and limit>0:
-            mid,ms=self.ops.clamp_quant_ep(gateup,limit=limit,mask_m=counts,expect_m=t)
+            mid,ms=self.ops.clamp_quant_ep(gateup,limit=limit,mask_m=counts,expect_m=hint)
         else:
             mid,ms=self.ops.silu_quant_ep(gateup,tokens_per_expert=counts)
-        self.ops.gemm_masked((mid,ms),(self.weights[1],self.w2_scale),output,counts,t)
+        self.ops.gemm_masked((mid,ms),(self.weights[1],self.w2_scale),output,counts,hint)
 
 
 def make_experts(moe,quant,weights,ops,prepare):
