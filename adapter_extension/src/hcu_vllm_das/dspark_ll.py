@@ -7,7 +7,18 @@ This transport policy is limited to single-node legacy IPC.
 """
 from __future__ import annotations
 
+from functools import lru_cache
+import logging
 import os
+
+
+@lru_cache(maxsize=64)
+def _record_layout(experts, buffer_id):
+    # Keep only an integer identity, never another owner of the native buffer.
+    logging.getLogger("vllm." + __name__).info(
+        "HCU W4A8 shared IPC LL admitted: experts=%d capacity=256 "
+        "buffer_id=%d wire=%s", experts, buffer_id,
+        "BF16/native-AGRS-receiver" if experts == 128 else "INT8/native-target")
 
 
 class SharedIPCManager:
@@ -46,4 +57,6 @@ class SharedIPCManager:
             raise ValueError("W4A8 shared LL geometry is outside the fixed contract")
         # Request the same native cache key for both layouts. Adding a second
         # cache alias would give the native manager two destruction owners.
-        return self.native.get_handle(expected)
+        buffer = self.native.get_handle(expected)
+        _record_layout(experts, id(buffer))
+        return buffer
