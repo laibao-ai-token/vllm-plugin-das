@@ -125,6 +125,9 @@ class HcuCTContiguousExperts(_Experts):
     ALIGNMENT=256
     def __init__(self,moe,quant,weights,ops):
         super().__init__(moe,quant);self.weights=weights;self.ops=ops
+        from .clamped_int8_admission import admitted
+        self._live_row_activation = admitted(ops, weights, self.w1_scale,
+            self.w2_scale, quant.gemm1_clamp_limit, masked=False)
     @staticmethod
     def activation_format(): return mk.FusedMoEActivationFormat.Standard
     def finalize_weight_and_reduce_impl(self): return TopKWeightAndReduceNoOP()
@@ -146,7 +149,10 @@ class HcuCTContiguousExperts(_Experts):
         self.ops.gemm_contiguous((data,scale),(self.weights[0],self.w1_scale),gateup,indices)
         qout=_resize_cache(workspace13.view(dtype=torch.int8),(aligned,n//2))
         limit=self.quant_config.gemm1_clamp_limit
-        if limit is not None and limit>0:
+        if self._live_row_activation:
+            from .clamped_int8_triton import clamped_int8_2304
+            mid,ms=clamped_int8_2304(gateup,indices,masked=False,output=qout)
+        elif limit is not None and limit>0:
             mid,ms=self.ops.clamp_quant(gateup,limit=limit,output=qout)
         else:
             mid,ms=self.ops.silu_quant(gateup,output=qout,expert_ids=indices)
@@ -161,6 +167,10 @@ class HcuCTMaskedExperts(_Experts):
     def __init__(self,moe,quant,weights,ops,capacity,dispatchers):
         super().__init__(moe,quant,max_num_tokens=capacity,num_dispatchers=dispatchers)
         self.weights=weights;self.ops=ops
+        from .clamped_int8_admission import admitted
+        self._live_row_activation = (capacity == 256 and dispatchers == 8
+            and admitted(ops, weights, self.w1_scale, self.w2_scale,
+                         quant.gemm1_clamp_limit, masked=True))
         self._small_batch_hint = False
         if (os.getenv('HCU_DSV41_W4A8_MOE_EXPECTED_M') == '1'
                 and capacity == 256 and dispatchers == 8
@@ -193,7 +203,10 @@ class HcuCTMaskedExperts(_Experts):
         gateup=_resize_cache(workspace13,(e,t,n))
         self.ops.gemm_masked((hidden_states,a1q_scale),(self.weights[0],self.w1_scale),gateup,counts,hint)
         limit=self.quant_config.gemm1_clamp_limit
-        if limit is not None and limit>0:
+        if self._live_row_activation:
+            from .clamped_int8_triton import clamped_int8_2304
+            mid,ms=clamped_int8_2304(gateup,counts,masked=True,expected_m=hint)
+        elif limit is not None and limit>0:
             mid,ms=self.ops.clamp_quant_ep(gateup,limit=limit,mask_m=counts,expect_m=hint)
         else:
             mid,ms=self.ops.silu_quant_ep(gateup,tokens_per_expert=counts)
