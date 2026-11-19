@@ -102,10 +102,16 @@ def _registered_ops():
         return False
 
 
-def configured_device(cfg, *, eager=False):
-    """Resolve per-attention startup policy before forwards and graph capture."""
+def configured_device(cfg):
+    """Resolve the existing WQ-B operand-sharing policy."""
+    if cfg.model_config.enforce_eager:
+        return None
+    return _configured_int8_device(cfg)
+
+
+def _configured_int8_device(cfg):
     p = cfg.parallel_config
-    if (not cfg.use_v2_model_runner or cfg.model_config.enforce_eager != eager
+    if (not cfg.use_v2_model_runner
             or p.tensor_parallel_size != 1 or p.prefill_context_parallel_size != 1
             or p.decode_context_parallel_size != 1 or p.use_ubatching
             or not torch.version.hip or not current_platform.is_rocm()
@@ -219,8 +225,8 @@ def share(cfg, device, attention, qr, qr_scale):
 
 
 def configure_direct_gemm(cfg):
-    """Resolve the opt-in legacy GEMM once during eager attention construction."""
-    device = configured_device(cfg, eager=True)
+    """Resolve the opt-in legacy GEMM for eager execution and graph capture."""
+    device = _configured_int8_device(cfg)
     if device is None:
         return None
     try:
@@ -229,23 +235,43 @@ def configure_direct_gemm(cfg):
         expected = ('a', 'b', 'scale_a', 'scale_b', 'm', 'n', 'k',
                     'transpose_flag', 'out_dtype', 'bias')
         if tuple(inspect.signature(hipblaslt_w8a8_gemm).parameters) == expected:
-            return device, hipblaslt_w8a8_gemm
+            from .environment import _flag
+
+            gemm = hipblaslt_w8a8_gemm
+            if _flag('HCU_DSV41_INT8_DIRECT_CAPTURE_LOG', default=False):
+                gemm = partial(_log_direct_capture, gemm)
+            return device, gemm
     except (ImportError, AttributeError, ValueError, TypeError):
         pass
-    _LOG.warning_once('Eager INT8 WQ-B direct GEMM unavailable: unsupported LightOp API')
+    _LOG.warning_once('INT8 direct GEMM unavailable: unsupported LightOp API')
     return None
 
 
-def project_eager_direct(binding, layer, qr, qr_scale):
-    """Reproduce native CT quantization and invoke the legacy LightOp GEMM."""
+_logged_capture_shapes = set()
+
+
+def _log_direct_capture(gemm, a, b, scale_a, scale_b, m, n, k, transpose_flag, out_dtype):
+    result = gemm(a, b, scale_a, scale_b, m, n, k, transpose_flag, out_dtype)
+    shape = (k, n)
+    if result[0] is True and shape not in _logged_capture_shapes and torch.cuda.is_current_stream_capturing():
+        _logged_capture_shapes.add(shape)
+        _LOG.warning('INT8 direct GEMM captured K=%d N=%d', k, n)
+    return result
+
+
+def project_direct(binding, layer, qr, qr_scale):
+    """Use the same GEMM for BF16 input and a shared INT8 operand."""
     device, gemm = binding
-    if (qr_scale is not None or not isinstance(qr, torch.Tensor)
-            or qr.dtype != torch.bfloat16 or not qr.is_cuda or qr.device.index != device
-            or qr.ndim != 2 or not 1 <= qr.shape[0] <= 256 or qr.shape[1] != _K
-            or torch.compiler.is_compiling() or torch.cuda.is_current_stream_capturing()
+    if (torch.compiler.is_compiling() or not isinstance(qr, torch.Tensor)
+            or not qr.is_cuda or qr.device.index != device or qr.ndim != 2
+            or not 1 <= qr.shape[0] <= 256 or qr.shape[1] != _K
             or not _layer_matches(layer, qr.device, indexer=False)):
         return None
-    return _direct_gemm(gemm, layer, qr, _K, _MAIN_N)
+    if _valid_pair(qr, qr_scale):
+        return _run_direct_gemm(gemm, layer, qr, qr_scale, _K, _MAIN_N, torch.bfloat16)
+    if qr.dtype == torch.bfloat16 and qr_scale is None:
+        return _direct_gemm(gemm, layer, qr, _K, _MAIN_N)
+    return None
 
 
 def _direct_gemm(gemm, layer, x, k, n):
@@ -255,17 +281,22 @@ def _direct_gemm(gemm, layer, x, k, n):
             or payload.device != x.device or not payload.is_contiguous()
             or scale.shape != (rows, 1) or scale.dtype != torch.float32
             or scale.device != x.device or not scale.is_contiguous()):
-        raise RuntimeError('Eager INT8 quantization returned an invalid operand')
+        raise RuntimeError('INT8 quantization returned an invalid operand')
+    return _run_direct_gemm(gemm, layer, payload, scale, k, n, x.dtype)
+
+
+def _run_direct_gemm(gemm, layer, payload, scale, k, n, dtype):
+    rows = payload.shape[0]
     status, out = gemm(payload, layer.weight.t(), scale, layer.weight_scale,
-                       rows, n, k, 'NT', x.dtype)
+                       rows, n, k, 'NT', dtype)
     if (status is not True or not isinstance(out, torch.Tensor)
-            or out.shape != (rows, n) or out.dtype != x.dtype or out.device != x.device):
-        raise RuntimeError('Eager INT8 direct GEMM returned an invalid result')
+            or out.shape != (rows, n) or out.dtype != dtype or out.device != payload.device):
+        raise RuntimeError('INT8 direct GEMM returned an invalid result')
     return out
 
 
 def bind_decoder_direct_gemm(binding, attention, moe):
-    """Attach the eager route to the three audited CT kernel instances."""
+    """Attach direct GEMM to the three audited CT kernel instances."""
     if binding is None:
         return
     shared = moe.shared_experts
@@ -292,7 +323,7 @@ def _apply_decoder_direct(original, binding, k, n, owner, layer, x, bias=None):
     if (layer is owner and bias is None and isinstance(x, torch.Tensor)
             and x.dtype == torch.bfloat16 and x.is_cuda and x.device.index == device
             and x.ndim == 2 and 1 <= x.shape[0] <= 256 and x.shape[1] == k
-            and not torch.compiler.is_compiling() and not torch.cuda.is_current_stream_capturing()):
+            and not torch.compiler.is_compiling()):
         weight, scale = layer.weight, layer.weight_scale
         witness = getattr(layer, '_hcu_int8_empty_witness', None)
         if (getattr(layer, '_hcu_int8_empty_state', None) == 'ready' and witness is not None

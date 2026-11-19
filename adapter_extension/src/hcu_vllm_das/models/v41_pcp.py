@@ -200,10 +200,10 @@ class HcuV41Fp4DecoderLayer(native.DeepseekV4DecoderLayer):
         if cfg.model_config.enforce_eager:
             from ..shared_expert_int8 import bind_shared_expert
             bind_shared_expert(cfg, self.ffn)
-            if not self.use_sequence_parallel and self.attn._int8_wq_b_direct is not None:
-                from ..int8_wq_b import bind_decoder_direct_gemm
+        if not self.use_sequence_parallel and self.attn._int8_wq_b_direct is not None:
+            from ..int8_wq_b import bind_decoder_direct_gemm
 
-                bind_decoder_direct_gemm(self.attn._int8_wq_b_direct, self.attn, self.ffn)
+            bind_decoder_direct_gemm(self.attn._int8_wq_b_direct, self.attn, self.ffn)
 
 
 _FP4_BACKBONE_INIT = _constructor(_BACKBONE_NATIVE, _REVIEWED[1],

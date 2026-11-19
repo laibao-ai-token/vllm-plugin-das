@@ -217,9 +217,9 @@ class Fp4Attention(rocm.DeepseekV41ROCMAiterMLAAttention, _Fp4CommonAttention):
 
     def _wq_b_proj(self, qr, qr_scale=None):
         if self._int8_wq_b_direct is not None:
-            from .int8_wq_b import project_eager_direct
+            from .int8_wq_b import project_direct
 
-            out = project_eager_direct(self._int8_wq_b_direct, self.wq_b, qr, qr_scale)
+            out = project_direct(self._int8_wq_b_direct, self.wq_b, qr, qr_scale)
             if out is not None:
                 return out
         if isinstance(qr, torch.Tensor) and qr.dtype == torch.int8:
