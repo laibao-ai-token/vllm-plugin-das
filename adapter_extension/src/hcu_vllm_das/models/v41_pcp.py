@@ -162,6 +162,8 @@ class HcuV41PcpForCausalLM(native_vl.DeepseekV41ForCausalLM):
             check_health()
             check_native_contract()
             _FP4_OUTER_INIT(self, vllm_config=vllm_config, prefix=prefix)
+            from ..dspark_ll import install_model_entry_reset
+            install_model_entry_reset(self, vllm_config, 384)
             return
         from ..v41_pcp_activation import check_health
         check_health()
@@ -177,6 +179,9 @@ class HcuV41PcpForCausalLM(native_vl.DeepseekV41ForCausalLM):
         else:
             # PCP1 without the explicit host route remains fully native.
             super().__init__(vllm_config=vllm_config, prefix=prefix)
+
+        from ..dspark_ll import install_model_entry_reset
+        install_model_entry_reset(self, vllm_config, 384)
 
 
 def _fp4_attention(cfg):
