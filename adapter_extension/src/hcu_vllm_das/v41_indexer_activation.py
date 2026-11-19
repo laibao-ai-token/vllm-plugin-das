@@ -51,6 +51,7 @@ def _digest_paths():
         Path(__file__).with_name('fp4_indexer.py'),
         Path(__file__).with_name('wo_a_layout.py'),
         Path(__file__).with_name('qkv_split.py'),
+        Path(__file__).with_name('dspark_post.py'),
         Path(__file__).with_name('fp4_indexer_lightop.py'),
         Path(__file__).with_name('v41_indexer.py'),
         Path(v41_fp8_indexer.__file__),
