@@ -222,6 +222,10 @@ def _load_with_scope(original, target_model, vllm_config):
         return original(target_model, vllm_config)
     if spec is None or getattr(spec, "method", None) != "dspark":
         return original(target_model, vllm_config)
+    from .dspark_backend import native_draft_ll_requested
+
+    if native_draft_ll_requested(vllm_config):
+        return original(target_model, vllm_config)
     if vllm_config.parallel_config.data_parallel_size <= 1:
         return original(target_model, vllm_config)
 

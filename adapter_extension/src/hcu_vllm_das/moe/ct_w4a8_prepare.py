@@ -42,6 +42,10 @@ class HcuCTLLPrepareAndFinalize(DeepEPLLPrepareAndFinalize):
     """Inherit native constructor/finalize; speak the actual HCU INT8 wire ABI."""
     use_int8_dispatch = True
 
+    def __init__(self, *args, reset_before_dispatch=False, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.reset_before_dispatch = reset_before_dispatch
+
     def prepare_async(self, a1, topk_weights, topk_ids, num_experts, expert_map,
                       apply_router_weight_on_input, quant_config, defer_input_quant=False):
         _check_quant(quant_config)
@@ -65,6 +69,12 @@ class HcuCTLLPrepareAndFinalize(DeepEPLLPrepareAndFinalize):
             a1 = a1 * topk_weights.to(a1.dtype)
             weights = torch.ones_like(topk_weights)
         ids = topk_ids if self.global_to_physical is None else self.global_to_physical[topk_ids]
+        if self.reset_before_dispatch:
+            # Emit even when the previous Python call used the same layout:
+            # graph replay may transition between different captured layouts.
+            self.buffer.clean_low_latency_buffer(
+                self.max_tokens_per_rank, a1.shape[1], num_experts,
+                quant_group_size=0, num_topk=ids.shape[1])
         received, counts, handle, _, hook = self.buffer.low_latency_dispatch(
             a1, ids, weights, self.max_tokens_per_rank, num_experts,
             quant_type=1, quant_group_size=0, fp8_round_scale=False,

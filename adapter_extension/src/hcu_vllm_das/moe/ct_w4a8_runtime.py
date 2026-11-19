@@ -52,8 +52,19 @@ def make_prepare(moe,descriptor,routing_tables,config=None):
     if backend=='allgather_reducescatter':
         from hcu_vllm_das.dspark_agrs import make_draft_prepare
         return make_draft_prepare(moe,config)
+    shared_ipc = False
+    factory_args = {}
+    if backend == 'deepep_low_latency' and config is not None:
+        from hcu_vllm_das.dspark_backend import native_draft_ll_requested
+
+        shared_ipc = native_draft_ll_requested(config)
+        if shared_ipc:
+            from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_manager
+            from hcu_vllm_das.dspark_ll import SharedIPCManager
+
+            factory_args['all2all_manager'] = SharedIPCManager(get_ep_all2all_manager())
     native=native_make_prepare_finalize(moe=moe,quant_config=descriptor,routing_tables=routing_tables,
-        allow_new_interface=True,use_monolithic=False,input_dtype=None)
+        allow_new_interface=True,use_monolithic=False,input_dtype=None,**factory_args)
     if backend=='deepep_low_latency' and not isinstance(native,DeepEPLLPrepareAndFinalize):
         raise RuntimeError('HCU W4A8 requested LL but native preparation chose another format')
     if backend=='deepep_high_throughput' and not isinstance(native,DeepEPHTPrepareAndFinalize):
@@ -65,7 +76,8 @@ def make_prepare(moe,descriptor,routing_tables,config=None):
         _require_abi(native.buffer.low_latency_combine,('out','return_recv_hook'))
         return HcuCTLLPrepareAndFinalize(native.buffer,native.max_num_tokens_per_rank(),native.num_dispatchers(),
             global_to_physical=native.global_to_physical,physical_to_global=native.physical_to_global,
-            local_expert_global_ids=native.local_expert_global_ids)
+            local_expert_global_ids=native.local_expert_global_ids,
+            reset_before_dispatch=shared_ipc)
     if isinstance(native,DeepEPHTPrepareAndFinalize):
         if native.num_dispatchers()!=moe.moe_parallel_config.ep_size:
             raise RuntimeError('DeepEP HT group disagrees with loaded MoE')
