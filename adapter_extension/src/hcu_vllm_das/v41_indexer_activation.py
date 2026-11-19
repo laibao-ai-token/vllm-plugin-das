@@ -57,12 +57,7 @@ def _digest_paths():
 
 
 def _digest_signature():
-    """Cheap change detector for the pinned files: (path, mtime, size) each.
-
-    Re-hashing five files on every decode step would put file I/O on the hot
-    path, because the FP4 branch asks for health each step. The signature is
-    what gets compared per step; the hash is only recomputed when it moves.
-    """
+    """Check pinned file metadata at lifecycle boundaries before rehashing."""
     signature = []
     for path in _digest_paths():
         stat = path.stat()
@@ -163,6 +158,15 @@ def admit_config(cfg):
             _publishing = False
 
 
+def check_fp4_dispatch():
+    """Read the admitted deployment and latched failure before FP4 execution."""
+    if _failure is not None:
+        raise ExtensionCommitError(_failure)
+    state = _state
+    if state is None or state['fp4'] is not True:
+        raise RuntimeError('V41 FP4 indexer requires deployment admission')
+
+
 def check_health():
     with _lock:
         if _failure is not None:
@@ -203,12 +207,8 @@ def check_health():
                 fp4_packer.check_health()
                 load_providers()
                 check_native_contract()
-                # Re-check here, not just at activation: a health check that
-                # only returned the digest captured at activation could not
-                # notice that the source changed afterwards, which made it a
-                # cache key rather than a continuing health guarantee. The stat
-                # signature is compared every call; the hash is recomputed only
-                # when it moves, so no file read lands on the decode hot path.
+                # Detect source drift at lifecycle checks before reusing the
+                # activation digest. FP4 dispatch uses the admitted state only.
                 if _digest_signature() != _state['signature']:
                     if _compute_digest() != _state['digest']:
                         _fatal('V41 FP4 indexer implementation changed since '

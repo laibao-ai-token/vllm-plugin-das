@@ -129,6 +129,11 @@ class HcuV41SparseAttnIndexer(_api['base']):
 
         return preflight(cfg)
 
+    def _fp4_check_dispatch(self):
+        from .v41_indexer_activation import check_fp4_dispatch
+
+        check_fp4_dispatch()
+
     def _fp4_execute(self, hidden_states, q_quant, weights):
         from .fp4_indexer_lightop import execute
 
