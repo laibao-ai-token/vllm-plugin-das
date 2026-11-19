@@ -40,6 +40,17 @@ def _source_matches(fn, digest):
         return False
 
 
+def _native_quant():
+    quant = ops.scaled_int8_quant
+    if hasattr(quant, '__wrapped__'):
+        try:
+            from hcu_adapter.bridges.vllm_input_quant_int8_lightop import native_quant_binding
+        except ImportError:
+            return quant
+        return native_quant_binding(ops)
+    return quant
+
+
 def _reviewed_source():
     amd, base, indexer = (rocm.DeepseekV41ROCMAiterMLAAttention,
                           common.DeepseekV4Attention, common.DeepseekV4Indexer)
@@ -63,7 +74,7 @@ def _reviewed_source():
         (kernel.apply_weights, 'c825e9cc457413d572e4bcffafd50d3256026d36e3ab83208947e7337371b0eb'),
         (kernel._get_layer_params, '748b270e83d959bdd74167e048c8df573806f6928930061aa08c06d1ab5489e1'),
         (triton._int8_scaled_mm_func, '90fac41461e287ff9da855adc7408073d459bc729ac5f0a8dd3e99413592b940'),
-        (ops.scaled_int8_quant, '195d8e863eb49e6ba2e59f6f822845a956a722f12a7a3b185c279a84d6b1f2ab'),
+        (_native_quant(), '195d8e863eb49e6ba2e59f6f822845a956a722f12a7a3b185c279a84d6b1f2ab'),
     ))
 
 
@@ -200,7 +211,7 @@ def share(cfg, device, attention, qr, qr_scale):
             or not _layer_matches(owner.wq_b, qr.device, indexer=True)):
         return qr, qr_scale
     with torch.profiler.record_function('hcu::dsv41_int8_wq_b_quant'):
-        payload, scale, azp = ops.scaled_int8_quant(qr.contiguous(), None, None, symmetric=True)
+        payload, scale, azp = _native_quant()(qr.contiguous(), None, None, symmetric=True)
     if azp is not None or not _valid_pair(payload, scale) or payload.shape != qr.shape:
         raise RuntimeError('INT8 WQ-B native dynamic quant returned an invalid operand')
     return payload, scale
