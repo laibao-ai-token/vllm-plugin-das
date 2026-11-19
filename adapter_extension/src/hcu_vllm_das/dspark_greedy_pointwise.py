@@ -63,7 +63,7 @@ def greedy(w1, w2, base, anchors, *, tile=2048, bias_fn=None, embed_fn=None, out
     assert positions == 5 and w1.shape == w2.shape == (v, 256)
     assert w1.dtype == w2.dtype == base.dtype == torch.bfloat16
     assert all(t.is_cuda and t.is_contiguous() for t in (w1, w2, base, anchors))
-    assert anchors.shape == (m,) and anchors.dtype == torch.int64
+    assert anchors.shape == (m,) and anchors.dtype in (torch.int32, torch.int64)
     nb = triton.cdiv(v, tile)
     maxima = torch.empty((m, nb), device=base.device, dtype=torch.float32)
     indices = torch.empty((m, nb), device=base.device, dtype=torch.int32)
