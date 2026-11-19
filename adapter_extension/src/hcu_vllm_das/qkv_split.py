@@ -15,7 +15,11 @@ import torch
 from vllm.triton_utils import tl, triton
 
 
-_VERIFIED_NATIVE_SHA256 = '06ecf1eaa83b9b29be5d3a7ef4eed9b66af5b47c97cfef6ccd48b5011f256568'
+_VERIFIED_NATIVE_SHA256 = {
+    '06ecf1eaa83b9b29be5d3a7ef4eed9b66af5b47c97cfef6ccd48b5011f256568',
+    # W4A8 container:322 eager cases and115 changing graph replays at block64.
+    'faa2d18b70f1d9ccf6fcfd1105701912ba6318201fb26d5a4350c11a74d42ac0',
+}
 
 
 def _native_build_matches():
@@ -23,7 +27,7 @@ def _native_build_matches():
         spec = find_spec('vllm._C_stable_libtorch')
         return (spec is not None and spec.origin is not None
                 and hashlib.sha256(Path(spec.origin).read_bytes()).hexdigest()
-                == _VERIFIED_NATIVE_SHA256)
+                in _VERIFIED_NATIVE_SHA256)
     except (ImportError, OSError, ValueError):
         return False
 
