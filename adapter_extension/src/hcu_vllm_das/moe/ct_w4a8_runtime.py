@@ -186,10 +186,12 @@ class HcuCTMaskedExperts(_Experts):
                          quant.gemm1_clamp_limit, masked=True))
         self._small_batch_hint = False
         hint_mode, _ = hcu_env.resolve('HCU_DSV41_W4A8_MOE_EXPECTED_M', host='vllm')
+        local_experts = int(self.w1_scale.shape[0])
         if (hint_mode == '1'
                 and capacity == 256 and dispatchers == 8
-                and tuple(self.w1_scale.shape[:2]) == (48, 4608)
-                and tuple(self.w2_scale.shape[:2]) == (48, 5120)
+                and local_experts in (16, 48)
+                and tuple(self.w1_scale.shape[:2]) == (local_experts, 4608)
+                and tuple(self.w2_scale.shape[:2]) == (local_experts, 5120)
                 and quant.gemm1_clamp_limit == 10
                 and weights[0].device.type == 'cuda'):
             props = torch.cuda.get_device_properties(weights[0].device)
@@ -211,9 +213,14 @@ class HcuCTMaskedExperts(_Experts):
         counts=expert_tokens_meta.expert_num_tokens
         # The hint selects kernels. Device counts still bound every expert's rows.
         hint = t
-        if self._small_batch_hint and global_num_experts == 384 and topk_ids.shape[1] == 6:
-            hint = expected_m(topk_ids.shape[0], self.num_dispatchers, 6,
+        if self._small_batch_hint and (e, global_num_experts, topk_ids.shape[1]) in (
+                (48, 384, 6), (16, 128, 3)):
+            hint = expected_m(topk_ids.shape[0], self.num_dispatchers, int(topk_ids.shape[1]),
                               global_num_experts, t)
+            # E16 native replays cover16/32/48 and full2048-row expert skew.
+            # Larger initialization-only shapes retain their native schedule.
+            if e == 16 and hint not in (16, 32, 48):
+                hint = t
         gateup=_resize_cache(workspace13,(e,t,n))
         self.ops.gemm_masked((hidden_states,a1q_scale),(self.weights[0],self.w1_scale),gateup,counts,hint)
         limit=self.quant_config.gemm1_clamp_limit
