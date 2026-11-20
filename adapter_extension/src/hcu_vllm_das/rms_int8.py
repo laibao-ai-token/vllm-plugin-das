@@ -47,6 +47,7 @@ def install_owned_decoder(decoder):
     projection = decoder.attn.fused_wqa_wkv
     scheme = getattr(projection, 'scheme', None)
     if (torch.version.hip is None or type(original) is not HcuRMSNorm
+            or original.weight.device.type != 'cuda'
             or original.hidden_size != 5120 or original.variance_epsilon != 1.e-20
             or not original.has_weight or not original.pass_weight
             or original.variance_size_override is not None
