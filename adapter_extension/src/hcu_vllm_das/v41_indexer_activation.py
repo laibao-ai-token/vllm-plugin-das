@@ -58,6 +58,7 @@ def _digest_paths():
         Path(v41_fp8_indexer.__file__),
         Path(triton.__file__),
         kernel_dir / 'fp4_staging_triton.py',
+        kernel_dir / 'indexer_live_mask_triton.py',
         kernel_dir / 'indexer_topk_lightop.py',
         kernel_dir / 'indexer_topk_post_triton.py',
     )
