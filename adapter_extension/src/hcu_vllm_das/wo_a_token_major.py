@@ -141,14 +141,25 @@ def _require_source(function, expected):
         raise RuntimeError(f"{_CAPABILITY} vLLM source differs: {function!r}")
 
 
-def _check_fp4_inheritance(attention, fp4_attention):
+def _check_fp4_inheritance(attention, fp4_attention, fp4_project=None):
     # Compare descriptors so a classmethod is checked against its actual owner.
     methods = ("forward", "_alloc_attn_out", "get_padded_num_q_heads",
-               "forward_mqa", "_o_proj", "_wo_b_after_wo_a")
+               "forward_mqa", "_wo_b_after_wo_a")
+    if fp4_project is None:
+        fp4_project = inspect.getattr_static(attention, "_o_proj")
     if (fp4_attention.__bases__[0] is not attention
+            or inspect.getattr_static(fp4_attention, "_o_proj") is not fp4_project
             or any(inspect.getattr_static(fp4_attention, name) is not
                    inspect.getattr_static(attention, name) for name in methods)):
         raise RuntimeError(f"{_CAPABILITY} FP4 attention inheritance changed")
+
+
+def owns_projection_wrapper(original):
+    if _publication is None:
+        return False
+    _, _, classes, wrapper, _ = _publication
+    return (classes[0]._o_proj is wrapper
+            and getattr(wrapper, '__wrapped__', None) is original)
 
 
 def _publish():
@@ -192,10 +203,12 @@ def _publish():
     from hcu_adapter.fp4_indexer import selected as fp4_selected
 
     attention_classes = (attention,)
+    fp4_project = None
     if fp4_selected():
-        from .fp4_indexer import Fp4Attention
+        from .fp4_indexer import Fp4Attention, _FP4_OUTPUT_PROJECTION
 
-        _check_fp4_inheritance(attention, Fp4Attention)
+        fp4_project = _FP4_OUTPUT_PROJECTION
+        _check_fp4_inheritance(attention, Fp4Attention, fp4_project)
         attention_classes = (attention, Fp4Attention)
     prepare_wrapper = _wrap_prepare(
         prepare, state, swa, CompilationMode.NONE, CUDAGraphMode.NONE, np,
@@ -209,18 +222,18 @@ def _publish():
         attention._o_proj = project_wrapper
     except BaseException as error:
         raise ExtensionCommitError(f"{_CAPABILITY} publication interrupted") from error
-    return state, prepare_wrapper, attention_classes, project_wrapper
+    return state, prepare_wrapper, attention_classes, project_wrapper, fp4_project
 
 
 def _check_health():
     if _publication is not None:
-        state, prepare, attention_classes, project = _publication
+        state, prepare, attention_classes, project, fp4_project = _publication
         if (not _enabled() or state.prepare_attn is not prepare
-                or any(cls._o_proj is not project for cls in attention_classes)):
+                or attention_classes[0]._o_proj is not project):
             raise ExtensionCommitError(f"{_CAPABILITY} policy or binding changed; restart")
         if len(attention_classes) == 2:
             try:
-                _check_fp4_inheritance(*attention_classes)
+                _check_fp4_inheritance(*attention_classes, fp4_project)
             except RuntimeError as error:
                 raise ExtensionCommitError(f"{_CAPABILITY} FP4 binding changed; restart") from error
 

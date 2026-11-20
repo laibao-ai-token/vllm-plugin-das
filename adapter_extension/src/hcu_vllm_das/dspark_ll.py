@@ -16,6 +16,20 @@ import weakref
 _MODEL_ENTRY_OWNERS = weakref.WeakKeyDictionary()
 
 
+def validate_legacy_ipc(buffer_cls):
+    if os.environ.get('ROCSHMEM_BACKEND', 'ipc') != 'ipc':
+        raise ValueError('W4A8 shared LL requires ROCSHMEM IPC')
+    for name in ('is_ll_layered_opt_enabled', 'is_ll_layered_develop_enabled'):
+        select = getattr(buffer_cls, name, None)
+        if not callable(select) or select(8):
+            raise ValueError('W4A8 shared LL requires native legacy IPC selection')
+    for name in ('ROCSHMEM_IPC_MNVL', 'DEEP_EP_NORMAL_MNVL'):
+        if os.environ.get(name, '0').strip().lower() not in ('0', 'false', 'off', ''):
+            raise ValueError('W4A8 shared LL does not support ' + name)
+    if os.environ.get('DEEPEP_TEST_FORCE_ROUTE_MODE', '').strip():
+        raise ValueError('W4A8 shared LL does not support forced routes')
+
+
 def install_model_entry_reset(model, config, num_experts):
     """Record layout initialization on every complete model invocation.
 
@@ -86,17 +100,7 @@ class SharedIPCManager:
                 or manager.internode or manager.world_size != 8
                 or manager.dp_world_size != 8 or manager.support_fault_tolerance):
             raise ValueError("W4A8 shared LL requires single-node native DP8/EP8")
-        if os.environ.get("ROCSHMEM_BACKEND", "ipc") != "ipc":
-            raise ValueError("W4A8 shared LL requires ROCSHMEM IPC")
-        for name in ("is_ll_layered_opt_enabled", "is_ll_layered_develop_enabled"):
-            select = getattr(deep_ep.Buffer, name, None)
-            if not callable(select) or select(8):
-                raise ValueError("W4A8 shared LL requires native legacy IPC selection")
-        for name in ("ROCSHMEM_IPC_MNVL", "DEEP_EP_NORMAL_MNVL"):
-            if os.environ.get(name, "0").strip().lower() not in ("0", "false", "off", ""):
-                raise ValueError("W4A8 shared LL does not support " + name)
-        if os.environ.get("DEEPEP_TEST_FORCE_ROUTE_MODE", "").strip():
-            raise ValueError("W4A8 shared LL does not support forced routes")
+        validate_legacy_ipc(deep_ep.Buffer)
         self.native = manager
         self.world_size = manager.world_size
         self.dp_world_size = manager.dp_world_size

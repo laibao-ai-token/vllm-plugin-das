@@ -89,7 +89,10 @@ def supported(owner, attn_out):
             or (owner.n_local_heads, owner.n_local_groups, owner.o_lora_rank) != (64, 8, 1024)
             or owner._wo_b_scale is not None):
         return False
-    if (rocm.DeepseekV41ROCMAiterMLAAttention._o_proj is not _O_PROJ
+    from .wo_a_token_major import owns_projection_wrapper
+
+    project = rocm.DeepseekV41ROCMAiterMLAAttention._o_proj
+    if ((project is not _O_PROJ and not owns_projection_wrapper(_O_PROJ))
             or rocm.DeepseekV41ROCMAiterMLAAttention._wo_b_after_wo_a is not _CONSUMER
             or rocm.rocm_inv_rope_einsum is not _EINSUM
             or native.rocm_inv_rope_einsum is not _EINSUM

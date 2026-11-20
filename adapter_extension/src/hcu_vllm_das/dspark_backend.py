@@ -21,7 +21,7 @@ def native_draft_ll_requested(config):
         # policy. Explicit requests keep the strict diagnostic error path.
         try:
             return _validate(config)
-        except (AttributeError, ValueError):
+        except (AttributeError, ImportError, OSError, ValueError):
             return False
     return _validate(config)
 
@@ -40,4 +40,8 @@ def _validate(config):
     # Reuse all default feature, topology and graph capacity checks without
     # constructing any model, communicator or transport resource.
     draft_config(config)
+    from deep_ep import Buffer
+    from .dspark_ll import validate_legacy_ipc
+
+    validate_legacy_ipc(Buffer)
     return True

@@ -250,3 +250,6 @@ class Fp4Attention(rocm.DeepseekV41ROCMAiterMLAAttention, _Fp4CommonAttention):
                 if qkv_split_supported(q, kv, cache, swa.slot_mapping, positions, cos_sin):
                     return split_qkv(q, kv, cache, swa.slot_mapping, positions, cos_sin)
         return super()._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
+
+
+_FP4_OUTPUT_PROJECTION = Fp4Attention._o_proj

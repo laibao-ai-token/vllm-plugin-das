@@ -47,6 +47,7 @@ def _digest_paths():
     from pathlib import Path
     from hcu_adapter import v41_fp8_indexer
     import hcu_adapter.v41_fp8_indexer_triton as triton
+    kernel_dir = Path(v41_fp8_indexer.__file__).with_name('kernels')
     return (
         Path(__file__).with_name('fp4_indexer.py'),
         Path(__file__).with_name('wo_a_layout.py'),
@@ -56,6 +57,9 @@ def _digest_paths():
         Path(__file__).with_name('v41_indexer.py'),
         Path(v41_fp8_indexer.__file__),
         Path(triton.__file__),
+        kernel_dir / 'fp4_staging_triton.py',
+        kernel_dir / 'indexer_topk_lightop.py',
+        kernel_dir / 'indexer_topk_post_triton.py',
     )
 
 
