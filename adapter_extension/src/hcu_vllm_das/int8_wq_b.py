@@ -264,6 +264,8 @@ def project_direct(binding, layer, qr, qr_scale):
     device, gemm = binding
     if (torch.compiler.is_compiling() or not isinstance(qr, torch.Tensor)
             or not qr.is_cuda or qr.device.index != device or qr.ndim != 2
+            # Legacy LightOp allocates its output on the current CUDA device.
+            or torch.cuda.current_device() != device
             or not 1 <= qr.shape[0] <= 256 or qr.shape[1] != _K
             or not _layer_matches(layer, qr.device, indexer=False)):
         return None
@@ -323,7 +325,7 @@ def _apply_decoder_direct(original, binding, k, n, owner, layer, x, bias=None):
     if (layer is owner and bias is None and isinstance(x, torch.Tensor)
             and x.dtype == torch.bfloat16 and x.is_cuda and x.device.index == device
             and x.ndim == 2 and 1 <= x.shape[0] <= 256 and x.shape[1] == k
-            and not torch.compiler.is_compiling()):
+            and not torch.compiler.is_compiling() and torch.cuda.current_device() == device):
         weight, scale = layer.weight, layer.weight_scale
         witness = getattr(layer, '_hcu_int8_empty_witness', None)
         if (getattr(layer, '_hcu_int8_empty_state', None) == 'ready' and witness is not None

@@ -32,6 +32,7 @@ class Providers:
     prefill: object
     decode: object
     native: object
+    native_calls: tuple = ()
 
 
 _CONTRACTS = (
@@ -49,14 +50,17 @@ _providers = None
 def load_providers():
     global _providers
     calls = []
+    native_calls = []
     native = import_module('lightop.op')
     for mod, name, parameters in _CONTRACTS:
         fn = getattr(import_module(mod), name, None)
         if not callable(fn) or tuple(inspect.signature(fn).parameters) != parameters:
             raise RuntimeError('FP4 provider ABI changed: ' + mod + '.' + name)
-        if not callable(getattr(native, name, None)):
+        native_fn = getattr(native, name, None)
+        if not callable(native_fn):
             raise RuntimeError('FP4 native symbol missing: ' + name)
         calls.append(fn)
+        native_calls.append(native_fn)
     prefill, decode = inspect.signature(calls[1]), inspect.signature(calls[2])
     if (prefill.parameters['candidate_blocks'].default is not None
             or prefill.parameters['candidate_query_lens'].default is not None
@@ -66,7 +70,7 @@ def load_providers():
             or decode.parameters['out'].default is not None
             or decode.parameters['rows_per_request'].default != 1):
         raise RuntimeError('FP4 provider defaults changed')
-    prepared = Providers(*calls, native)
+    prepared = Providers(*calls, native, tuple(native_calls))
     if _providers is not None and prepared != _providers:
         raise RuntimeError('FP4 provider ownership changed; start a new process')
     _providers = prepared
@@ -76,6 +80,11 @@ def load_providers():
 def providers():
     if _providers is None:
         raise RuntimeError('FP4 providers not prepared before allocation')
+    # LightOp's Python wrappers resolve these native symbols on each call.
+    # Check identity before dispatch without repeating startup ABI inspection.
+    for (_, name, _), expected in zip(_CONTRACTS, _providers.native_calls):
+        if getattr(_providers.native, name, None) is not expected:
+            raise RuntimeError('FP4 provider ownership changed; start a new process')
     return _providers
 
 

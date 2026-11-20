@@ -3,9 +3,9 @@
 from __future__ import annotations
 from functools import lru_cache
 import inspect
-import os
 from types import SimpleNamespace
 import torch
+from hcu_adapter import hcu_env
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.all2all_utils import maybe_make_prepare_finalize as native_make_prepare_finalize
@@ -172,7 +172,8 @@ class HcuCTMaskedExperts(_Experts):
             and admitted(ops, weights, self.w1_scale, self.w2_scale,
                          quant.gemm1_clamp_limit, masked=True))
         self._small_batch_hint = False
-        if (os.getenv('HCU_DSV41_W4A8_MOE_EXPECTED_M') == '1'
+        hint_mode, _ = hcu_env.resolve('HCU_DSV41_W4A8_MOE_EXPECTED_M', host='vllm')
+        if (hint_mode == '1'
                 and capacity == 256 and dispatchers == 8
                 and tuple(self.w1_scale.shape[:2]) == (48, 4608)
                 and tuple(self.w2_scale.shape[:2]) == (48, 5120)

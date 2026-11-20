@@ -117,6 +117,23 @@ def _prepare_fp4():
     return _compute_digest(), _digest_signature()
 
 
+def fp4_reader_ready():
+    """Probe the reader for auto selection without publishing FP4 deployment state."""
+    with _lock:
+        if _failure is not None:
+            raise ExtensionCommitError(_failure)
+        try:
+            from .fp4_indexer_lightop import load_providers
+
+            load_providers()
+        except ExtensionCommitError:
+            raise
+        except (ImportError, OSError, RuntimeError, TypeError, ValueError):
+            # An explicit MXFP4 request still goes through strict admission.
+            return False
+        return True
+
+
 def _record_fp4():
     from hcu_adapter import registry as adapter_registry
     adapter_registry.register(
@@ -165,6 +182,21 @@ def check_fp4_dispatch():
     state = _state
     if state is None or state['fp4'] is not True:
         raise RuntimeError('V41 FP4 indexer requires deployment admission')
+
+
+def check_graph_fp4_provider():
+    state = _state
+    if state is not None and state.get('fp4') is True:
+        from .fp4_indexer_lightop import providers
+
+        check_fp4_dispatch()
+        try:
+            providers()
+        except RuntimeError as error:
+            try:
+                _fatal(str(error))
+            except ExtensionCommitError as refusal:
+                raise refusal from error
 
 
 def check_health():

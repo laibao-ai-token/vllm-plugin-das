@@ -67,6 +67,18 @@ def graph_capture_allowed(config):
     return _impl.graph_capture_allowed(config)
 
 
+def _fp4_reader_ready():
+    from .v41_indexer_activation import fp4_reader_ready
+
+    return fp4_reader_ready()
+
+
+def _check_graph_fp4_provider():
+    from .v41_indexer_activation import check_graph_fp4_provider
+
+    check_graph_fp4_provider()
+
+
 def _register_split_hook(config):
     return globals()['register_splitting_op'](config)
 
@@ -82,6 +94,8 @@ _impl.bind_runtime_resolvers(
     gather_kv=lambda: globals()['cp_gather_indexer_k_quant_cache_triton'],
     enabled=lambda: globals()['enabled'](),
     health=_check_health,
+    fp4_reader_ready=_fp4_reader_ready,
+    check_graph_fp4_provider=_check_graph_fp4_provider,
     register_split=lambda: _register_split_hook,
     # Three names the old module owned that a caller may still patch. The
     # adapter reads them through these resolvers, so the patch keeps reaching

@@ -218,6 +218,11 @@ def _check_health():
         if (not _enabled() or state.prepare_attn is not prepare
                 or any(cls._o_proj is not project for cls in attention_classes)):
             raise ExtensionCommitError(f"{_CAPABILITY} policy or binding changed; restart")
+        if len(attention_classes) == 2:
+            try:
+                _check_fp4_inheritance(*attention_classes)
+            except RuntimeError as error:
+                raise ExtensionCommitError(f"{_CAPABILITY} FP4 binding changed; restart") from error
 
 
 def _activate(context):
