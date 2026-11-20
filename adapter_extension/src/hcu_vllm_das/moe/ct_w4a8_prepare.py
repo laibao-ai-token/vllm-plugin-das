@@ -100,7 +100,7 @@ class HcuCTLLPrepareAndFinalize(DeepEPLLPrepareAndFinalize):
             self.handles[dbo_current_ubatch_id()] = handle
             def receive():
                 # The modular kernel calls this only after the native recv
-                # hook. Keep current device counts and the actual AG/RS JIT.
+                # hook. Reuse the public AG/RS quantizer and retain device counts.
                 from hcu_vllm_das.dspark_ll_quant import quantize_receiver
                 q, scale = quantize_receiver(received, counts)
                 return q, scale, mk.ExpertTokensMetadata(counts, None), None, None

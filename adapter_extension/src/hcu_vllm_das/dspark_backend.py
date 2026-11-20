@@ -43,5 +43,9 @@ def _validate(config):
     from deep_ep import Buffer
     from .dspark_ll import validate_legacy_ipc
 
+    from .dspark_ll_quant import receiver_quantizer_available
+
     validate_legacy_ipc(Buffer)
+    if not receiver_quantizer_available():
+        raise ValueError("W4A8 draft LL requires vLLM public per-token INT8 quantization")
     return True

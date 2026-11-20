@@ -18,7 +18,7 @@ from vllm.v1.attention.backends.mla import indexer as metadata
 
 from . import fp4_packer, wo_a_layout
 from .fp4_indexer_lightop import Fp4Query, cache_view, load_providers, providers, rotate_bf16
-from .qkv_split import split_qkv, supported as qkv_split_supported
+from .qkv_split import qualify_qkv_split, split_qkv, supported as qkv_split_supported
 
 
 # anchor-baseline(③): Core 5afd482929, 0.33.1.dev3, constructor globals are
@@ -188,7 +188,10 @@ class Fp4Attention(rocm.DeepseekV41ROCMAiterMLAAttention, _Fp4CommonAttention):
 
         cfg = args[0] if args else kwargs['vllm_config']
         super().__init__(*args, **kwargs)
-        self._hcu_wo_a_layout = wo_a_layout.configured(cfg)
+        if (not self.use_pcp and not self.kv_mxfp8 and not self.accepts_unnormed_unroped_query
+                and self.n_local_heads == self.padded_heads == 64):
+            qualify_qkv_split(self.rotary_emb.cos_sin_cache.device)
+        self._hcu_wo_a_layout = wo_a_layout.configured(cfg, self.wo_a.weight.device)
         self._int8_wq_b_device = None
         self._int8_wq_b_direct = None
         if type(self) is Fp4Attention and _flag('HCU_DSV41_WQ_B_INT8_DIRECT', default=False):

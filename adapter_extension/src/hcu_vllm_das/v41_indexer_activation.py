@@ -87,7 +87,10 @@ def _compute_digest():
 
 def policy_factor():
     if _state is not None and _state.get('fp4', False):
-        return ('fp4-lightop', _state['digest'])
+        from . import qkv_split, wo_a_layout
+
+        return ('fp4-lightop', _state['digest'], qkv_split.preflight_admitted(),
+                wo_a_layout.preflight_admitted())
     return _state['enabled'] if _state is not None else _flag(_FLAG, default=True)
 
 
