@@ -204,6 +204,22 @@ class HcuV41Fp4DecoderLayer(native.DeepseekV4DecoderLayer):
             from ..int8_wq_b import bind_decoder_direct_gemm
 
             bind_decoder_direct_gemm(self.attn._int8_wq_b_direct, self.attn, self.ffn)
+        from ..rms_int8 import install_owned_decoder
+        self._hcu_paired_attention_norm = install_owned_decoder(self)
+
+    def forward(self, *args, **kwargs):
+        if not self._hcu_paired_attention_norm:
+            return super().forward(*args, **kwargs)
+        from hcu_adapter.rms_int8_scope import attention_norm_scope
+        with attention_norm_scope():
+            return super().forward(*args, **kwargs)
+
+    def write_kv(self, *args, **kwargs):
+        if not self._hcu_paired_attention_norm:
+            return super().write_kv(*args, **kwargs)
+        from hcu_adapter.rms_int8_scope import attention_norm_scope
+        with attention_norm_scope():
+            return super().write_kv(*args, **kwargs)
 
 
 _FP4_BACKBONE_INIT = _constructor(_BACKBONE_NATIVE, _REVIEWED[1],
