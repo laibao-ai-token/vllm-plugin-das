@@ -2,6 +2,7 @@
 """Owned HIPC experts and public modular-kernel composition for CT W4A8."""
 from __future__ import annotations
 from functools import lru_cache
+import copy
 import inspect
 from types import SimpleNamespace
 import torch
@@ -14,7 +15,7 @@ from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import TopKWeig
 from vllm.model_executor.layers.fused_moe.utils import _resize_cache
 from vllm.model_executor.layers.quantization.utils.quant_utils import kInt4W4A8StaticChannelSym, kInt8DynamicTokenSym
 from vllm.platforms import current_platform
-from .ct_w4a8_hints import expected_m
+from .ct_w4a8_hints import expected_m, masked_gemm
 from .ct_w4a8_prepare import HcuCTHTPrepareAndFinalize,HcuCTLLPrepareAndFinalize,DeepEPHTPrepareAndFinalize,DeepEPLLPrepareAndFinalize
 
 
@@ -54,6 +55,7 @@ def make_prepare(moe,descriptor,routing_tables,config=None):
         return make_draft_prepare(moe,config)
     shared_ipc = False
     factory_args = {}
+    factory_moe = moe
     if backend == 'deepep_low_latency' and config is not None:
         from hcu_vllm_das.dspark_backend import native_draft_ll_requested
 
@@ -61,16 +63,20 @@ def make_prepare(moe,descriptor,routing_tables,config=None):
         if shared_ipc:
             from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_manager
             from hcu_vllm_das.dspark_ll import SharedIPCManager
+            from hcu_vllm_das.dspark_graph import token_capacity
 
-            factory_args['all2all_manager'] = SharedIPCManager(get_ep_all2all_manager())
-    native=native_make_prepare_finalize(moe=moe,quant_config=descriptor,routing_tables=routing_tables,
+            capacity = token_capacity(config).query_rows
+            factory_args['all2all_manager'] = SharedIPCManager(get_ep_all2all_manager(), capacity)
+            factory_moe = copy.copy(moe)
+            factory_moe.max_num_tokens = capacity
+    native=native_make_prepare_finalize(moe=factory_moe,quant_config=descriptor,routing_tables=routing_tables,
         allow_new_interface=True,use_monolithic=False,input_dtype=None,**factory_args)
     if backend=='deepep_low_latency' and not isinstance(native,DeepEPLLPrepareAndFinalize):
         raise RuntimeError('HCU W4A8 requested LL but native preparation chose another format')
     if backend=='deepep_high_throughput' and not isinstance(native,DeepEPHTPrepareAndFinalize):
         raise RuntimeError('HCU W4A8 requested HT but native preparation chose another format')
     if isinstance(native,DeepEPLLPrepareAndFinalize):
-        if native.max_num_tokens_per_rank()!=moe.max_num_tokens or native.num_dispatchers()!=moe.moe_parallel_config.ep_size:
+        if native.max_num_tokens_per_rank()!=factory_moe.max_num_tokens or native.num_dispatchers()!=moe.moe_parallel_config.ep_size:
             raise RuntimeError('DeepEP LL capacity/group disagrees with loaded MoE')
         _require_abi(native.buffer.low_latency_dispatch,('topk_weight','quant_type','quant_group_size','return_recv_hook'))
         _require_abi(native.buffer.low_latency_combine,('out','return_recv_hook'))
@@ -214,16 +220,14 @@ class HcuCTMaskedExperts(_Experts):
         counts=expert_tokens_meta.expert_num_tokens
         # The hint selects kernels. Device counts still bound every expert's rows.
         hint = t
-        if self._small_batch_hint and (e, global_num_experts, topk_ids.shape[1]) in (
-                (48, 384, 6), (16, 128, 3)):
-            hint = expected_m(topk_ids.shape[0], self.num_dispatchers, int(topk_ids.shape[1]),
+        use_hint = self._small_batch_hint and (e, global_num_experts, topk_ids.shape[1]) in (
+            (48, 384, 6), (16, 128, 3))
+        if use_hint:
+            hint = expected_m(topk_ids.shape[0], self.num_dispatchers, topk_ids.shape[1],
                               global_num_experts, t)
-            # E16 native replays cover16/32/48 and full2048-row expert skew.
-            # Larger initialization-only shapes retain their native schedule.
-            if e == 16 and hint not in (16, 32, 48):
-                hint = t
         gateup=_resize_cache(workspace13,(e,t,n))
-        self.ops.gemm_masked((hidden_states,a1q_scale),(self.weights[0],self.w1_scale),gateup,counts,hint)
+        self._masked_gemm((hidden_states, a1q_scale), (self.weights[0], self.w1_scale),
+                          gateup, counts, hint, use_hint)
         limit=self.quant_config.gemm1_clamp_limit
         if self._live_row_activation:
             from .clamped_int8_triton import clamped_int8_2304
@@ -232,7 +236,13 @@ class HcuCTMaskedExperts(_Experts):
             mid,ms=self.ops.clamp_quant_ep(gateup,limit=limit,mask_m=counts,expect_m=hint)
         else:
             mid,ms=self.ops.silu_quant_ep(gateup,tokens_per_expert=counts)
-        self.ops.gemm_masked((mid,ms),(self.weights[1],self.w2_scale),output,counts,hint)
+        self._masked_gemm((mid, ms), (self.weights[1], self.w2_scale), output, counts,
+                          hint, use_hint)
+
+    def _masked_gemm(self, inputs, weights, output, counts, hint, use_hint):
+        if use_hint:
+            return masked_gemm(self.ops.gemm_masked, inputs, weights, output, counts, hint)
+        return self.ops.gemm_masked(inputs, weights, output, counts, hint)
 
 
 def make_experts(moe,quant,weights,ops,prepare):

@@ -25,10 +25,12 @@ def _native_contract():
 
 
 def supported(model, spec, num_reqs, hidden, *, require_qualification=True):
+    steps = getattr(spec, 'num_speculative_steps', None)
+    tokens = getattr(spec, 'draft_tokens', None)
     if (not getattr(model, '_hcu_markov_pointwise', False)
             or getattr(spec, 'model', None) is not model
-            or type(num_reqs) is not int or not 1 <= num_reqs <= 32
-            or getattr(spec, 'num_speculative_steps', None) != 5
+            or type(num_reqs) is not int or not 1 <= num_reqs <= 64
+            or type(steps) is not int or not 1 <= steps <= 7
             or getattr(spec, 'draft_logits', False) is not None
             or getattr(spec, 'draft_watermarker', False) is not None
             or getattr(spec, '_d2t_scatter_index', False) is not None
@@ -59,8 +61,8 @@ def supported(model, spec, num_reqs, hidden, *, require_qualification=True):
             or processor.scale != 1.0 or processor.soft_cap is not None
             or processor.logits_as_input or processor.org_vocab_size != 129280):
         return False
-    tokens = spec.draft_tokens
-    if (tokens.ndim != 2 or tokens.shape[0] < num_reqs or tokens.shape[1] != 5
+    if (not isinstance(tokens, torch.Tensor) or tokens.ndim != 2
+            or tokens.shape[0] < num_reqs or tokens.shape[1] != steps
             or tokens.dtype != torch.int64 or tokens.stride(1) != 1
             or tokens.device != w1.device):
         return False
@@ -69,7 +71,7 @@ def supported(model, spec, num_reqs, hidden, *, require_qualification=True):
         return False
     if (require_qualification and not valid
             and getattr(model, '_hcu_markov_preflight', None)
-            != (os.getpid(), native_spec._sample_sequential)):
+            != (os.getpid(), native_spec._sample_sequential, steps)):
         return False
     for name in ('markov_embed', 'markov_bias', 'map_draft_to_target'):
         if getattr(getattr(model, name), '__func__', None) is not getattr(native_model, name):
@@ -83,7 +85,7 @@ def supported(model, spec, num_reqs, hidden, *, require_qualification=True):
 @lru_cache(maxsize=1)
 def _log_admission():
     logging.getLogger('vllm.' + __name__).info(
-        'HCU W4A8 exact greedy Markov pointwise admitted: V129280 R256 DSpark5; native bias projection retained')
+        'HCU W4A8 exact greedy Markov pointwise admitted: V129280 R256; native bias projection retained')
 
 
 @torch.inference_mode()
@@ -104,10 +106,14 @@ def qualify_markov(model, spec):
         if torch.cuda.is_current_stream_capturing():
             return False
         try:
+            steps = spec.num_speculative_steps
+            if type(steps) is not int or not 1 <= steps <= 7:
+                return False
             generator = torch.Generator(device=device).manual_seed(7851)
             for requests, dtype, magnitude in (
-                    (1, torch.int32, 0.), (8, torch.int64, 1.), (32, torch.int32, 8.)):
-                n = requests * 5
+                    (1, torch.int32, 0.), (8, torch.int64, 1.),
+                    (32, torch.int32, 8.), (64, torch.int64, 1.)):
+                n = requests * steps
                 indices = torch.arange(n, device=device)
                 hidden = torch.empty((n, 5120), device=device, dtype=torch.bfloat16)
                 probe = SimpleNamespace(
@@ -116,12 +122,12 @@ def qualify_markov(model, spec):
                     _d2t_scatter_index=spec._d2t_scatter_index, _draft_topk=spec._draft_topk,
                     use_confidence_head=spec.use_confidence_head,
                     acceptance_estimator=spec.acceptance_estimator,
-                    sample_indices=indices, sample_idx_mapping=indices // 5,
+                    sample_indices=indices, sample_idx_mapping=indices // steps,
                     sample_pos=torch.ones_like(indices), _step_cols=spec._step_cols,
                     input_buffers=SimpleNamespace(input_ids=torch.randint(
                         129280, (requests,), device=device, dtype=dtype, generator=generator)),
                     _anchor_idx=torch.arange(requests, device=device),
-                    draft_tokens=torch.full((requests + 1, 5), -1, device=device, dtype=torch.int64))
+                    draft_tokens=torch.full((requests + 1, steps), -1, device=device, dtype=torch.int64))
                 probe._sample_logits = MethodType(native_spec._sample_logits, probe)
                 probe._maybe_predict_acceptance = MethodType(native_spec._maybe_predict_acceptance, probe)
                 if not supported(model, probe, requests, hidden, require_qualification=False):
@@ -143,7 +149,7 @@ def qualify_markov(model, spec):
         except (AttributeError, OSError, TypeError, ValueError, RuntimeError) as error:
             _LOG.warning('HCU greedy Markov preflight unavailable: %s', error)
             return False
-    model._hcu_markov_preflight = (os.getpid(), native_spec._sample_sequential)
+    model._hcu_markov_preflight = (os.getpid(), native_spec._sample_sequential, steps)
     _LOG.info('HCU greedy Markov admitted after native sampling preflight')
     return True
 
@@ -154,7 +160,7 @@ def _write_draft_tokens(model, spec, num_reqs, base):
     anchors = spec.input_buffers.input_ids[spec._anchor_idx[:num_reqs]]
     head = model.model.markov_head
     greedy(head.markov_w1.weight, head.markov_w2.weight,
-           base.view(num_reqs, 5, 129280), anchors,
+           base.view(num_reqs, spec.num_speculative_steps, 129280), anchors,
            bias_fn=model.markov_bias, embed_fn=model.markov_embed,
            out=spec.draft_tokens[:num_reqs])
 
@@ -162,7 +168,7 @@ def _write_draft_tokens(model, spec, num_reqs, base):
 def sample_sequential(model, spec, num_reqs, head_hidden):
     if not supported(model, spec, num_reqs, head_hidden):
         return False
-    n = num_reqs * 5
+    n = num_reqs * spec.num_speculative_steps
     sample_hidden = head_hidden[spec.sample_indices[:n]]
     base = model.compute_draft_logits(sample_hidden)
     # The layout check runs before any custom writes to the draft buffer.

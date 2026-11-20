@@ -33,10 +33,6 @@ def _validate(config):
     if (_owned_quant_kind(config) != "ct_w4a8"
             or not native_decode_dspark(config) or is_owned_draft(config)):
         raise ValueError("W4A8 draft LL requires the native CT DP8/EP8 target")
-    scheduler, spec = config.scheduler_config, config.speculative_config
-    if (scheduler.max_num_batched_tokens, scheduler.max_num_seqs,
-            spec.num_speculative_tokens) != (256, 32, 5):
-        raise ValueError("W4A8 draft LL requires the fixed 256/32/5 token contract")
     # Reuse all default feature, topology and graph capacity checks without
     # constructing any model, communicator or transport resource.
     draft_config(config)

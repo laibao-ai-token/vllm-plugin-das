@@ -32,11 +32,11 @@ def quantize_receiver(x, counts):
     quantized too because its output is never consumed by the masked GEMM.
     """
     if (x.dtype != torch.bfloat16 or x.ndim != 3
-            or x.shape[0] not in (16, 48) or x.shape[1:] != (2048, 5120)
-            or not x.is_cuda or not x.is_contiguous()
+            or x.shape[0] not in (16, 48) or x.shape[1] <= 0 or x.shape[2] != 5120
+            or x.shape[1] % 8 != 0 or not x.is_cuda or not x.is_contiguous()
             or counts.dtype != torch.int32 or counts.shape != x.shape[:1]
             or counts.device != x.device or not counts.is_contiguous()):
-        raise ValueError('W4A8 draft receiver requires the fixed256x8 LL layout')
+        raise ValueError('W4A8 draft receiver requires the contiguous DP8 LL layout')
     quantize = _receiver_quantizer()
     if quantize is None:
         raise RuntimeError('W4A8 draft LL receiver selected without a quantizer')

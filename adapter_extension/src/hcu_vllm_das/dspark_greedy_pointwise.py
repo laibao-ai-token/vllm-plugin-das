@@ -60,7 +60,7 @@ def step(base, bias, table, tokens, embedding, maxima, indices, *, tile=2048, ga
 @torch.inference_mode()
 def greedy(w1, w2, base, anchors, *, tile=2048, bias_fn=None, embed_fn=None, out=None):
     m, positions, v = base.shape
-    assert positions == 5 and w1.shape == w2.shape == (v, 256)
+    assert positions > 0 and w1.shape == w2.shape == (v, 256)
     assert w1.dtype == w2.dtype == base.dtype == torch.bfloat16
     assert all(t.is_cuda and t.is_contiguous() for t in (w1, w2, base, anchors))
     assert anchors.shape == (m,) and anchors.dtype in (torch.int32, torch.int64)
@@ -69,16 +69,16 @@ def greedy(w1, w2, base, anchors, *, tile=2048, bias_fn=None, embed_fn=None, out
     indices = torch.empty((m, nb), device=base.device, dtype=torch.int32)
     embeddings = [torch.empty((m, 256), device=base.device, dtype=torch.bfloat16)
                   for _ in range(2)]
-    tokens = (torch.empty((m, 5), device=base.device, dtype=torch.int64)
+    tokens = (torch.empty((m, positions), device=base.device, dtype=torch.int64)
               if out is None else out)
-    assert tokens.shape == (m, 5) and tokens.dtype == torch.int64
+    assert tokens.shape == (m, positions) and tokens.dtype == torch.int64
     embed = (torch.nn.functional.embedding(anchors, w1)
              if embed_fn is None else embed_fn(anchors))
-    for i in range(5):
+    for i in range(positions):
         bias = (torch.nn.functional.linear(embed, w2)
                 if bias_fn is None else bias_fn(embed))
         next_embed = embeddings[i % 2]
         step(base[:, i], bias, w1, tokens[:, i], next_embed, maxima, indices,
-             tile=tile, gather=(i != 4))
+             tile=tile, gather=(i != positions - 1))
         embed = next_embed
     return tokens

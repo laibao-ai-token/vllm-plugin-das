@@ -70,9 +70,8 @@ def _validate(config):
     hf = getattr(mc, "hf_text_config", None)
     if hf is None:
         hf = getattr(mc.hf_config, "text_config", mc.hf_config)
-    if (getattr(hf, "hidden_size", None), getattr(hf, "hc_mult", None),
-            config.speculative_config.num_speculative_tokens) != (5120, 4, 5):
-        raise ValueError("Draft final Post requires the verified H5120/HC4/DSpark5 contract")
+    if (getattr(hf, "hidden_size", None), getattr(hf, "hc_mult", None)) != (5120, 4):
+        raise ValueError("Draft final Post requires its kernel's H5120/HC4 layout")
     return True
 
 
