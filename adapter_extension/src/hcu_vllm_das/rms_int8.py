@@ -7,6 +7,7 @@ import torch
 from hcu_adapter import rms_int8_scope as scope
 from hcu_adapter.dsv41_int8_linear import HcuDSV41Int8LinearMethod
 from vllm import envs, ir
+from vllm.config import CompilationMode, get_current_vllm_config
 from vllm.model_executor.kernels.linear.scaled_mm.triton import TritonInt8ScaledMMLinearKernel
 from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a8_int8 import CompressedTensorsW8A8Int8
 
@@ -61,6 +62,10 @@ def install_owned_decoder(decoder):
             or scheme.strategy != 'channel' or scheme.is_static_input_scheme
             or not scheme.input_symmetric
             or type(scheme.kernel) is not TritonInt8ScaledMMLinearKernel):
+        return False
+    # The scoped handoff is Python orchestration. It is captured normally by
+    # whole-model CUDA graphs, but is not an Inductor graph rewrite.
+    if get_current_vllm_config().compilation_config.mode != CompilationMode.NONE:
         return False
     props = torch.cuda.get_device_properties(original.weight.device)
     if props.gcnArchName.split(':')[0] != 'gfx938' or props.multi_processor_count != 64:
