@@ -71,7 +71,7 @@ def install_owned_decoder(decoder):
     if props.gcnArchName.split(':')[0] != 'gfx938' or props.multi_processor_count != 64:
         return False
     # Compile/load once while constructing the model, outside CUDA graph capture.
-    from hcu_adapter.kernels.rms_int8_hip import module
+    from hcu_adapter.kernels.rms_int8_cpp import module
     fused = module().apply
     decoder.attn_norm = PairedAttentionRMSNorm(original, fused)
     _LOG.info('HCU W4A8 paired native RMS/dynamic INT8 enabled: %s', decoder.attn.prefix)
