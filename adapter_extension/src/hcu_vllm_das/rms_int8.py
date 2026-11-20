@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Owned decoder attention RMS and native CT input-quantization handoff."""
 import logging
+import math
 
 import torch
 from hcu_adapter import rms_int8_scope as scope
@@ -49,7 +50,8 @@ def install_owned_decoder(decoder):
     scheme = getattr(projection, 'scheme', None)
     if (torch.version.hip is None or type(original) is not HcuRMSNorm
             or original.weight.device.type != 'cuda'
-            or original.hidden_size != 5120 or original.variance_epsilon != 1.e-20
+            or original.hidden_size != 5120
+            or not math.isfinite(original.variance_epsilon) or original.variance_epsilon < 0
             or not original.has_weight or not original.pass_weight
             or original.variance_size_override is not None
             or decoder.use_sequence_parallel or decoder.fuse_seam_norm
@@ -68,7 +70,7 @@ def install_owned_decoder(decoder):
     if get_current_vllm_config().compilation_config.mode != CompilationMode.NONE:
         return False
     props = torch.cuda.get_device_properties(original.weight.device)
-    if props.gcnArchName.split(':')[0] != 'gfx938' or props.multi_processor_count != 64:
+    if props.gcnArchName.split(':')[0] != 'gfx938':
         return False
     # Compile/load once while constructing the model, outside CUDA graph capture.
     from hcu_adapter.kernels.rms_int8_cpp import module

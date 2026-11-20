@@ -111,7 +111,7 @@ def _qualify_layout(device, cache, transposed):
                     rotary_emb=None, rope_head_dim=64,
                     wo_a=SimpleNamespace(weight=physical_weight),
                     _wo_b_after_wo_a=lambda value: value)
-                for rows in (8, 48, 64):
+                for rows in (1, 8, 17, 32, 48, 64, 65, 128, 192, 255, 256):
                     for heads in (64, 128):
                         attn_out = torch.randn((rows, heads, 512), dtype=torch.bfloat16,
                                                device=device, generator=generator)
@@ -137,7 +137,7 @@ def supported(owner, attn_out):
             or not (_SOURCE_MATCHES or attn_out.device in _qualified_devices)
             or torch.is_grad_enabled() or torch.is_autocast_enabled('cuda')
             or not attn_out.is_cuda or attn_out.dtype != torch.bfloat16
-            or attn_out.ndim != 3 or attn_out.shape[0] not in (8, 48, 64)
+            or attn_out.ndim != 3 or not 0 < attn_out.shape[0] <= 256
             or attn_out.shape[1] not in (64, 128) or attn_out.shape[2] != 512
             or not attn_out.is_contiguous()
             or (owner.n_local_heads, owner.n_local_groups, owner.o_lora_rank) != (64, 8, 1024)
@@ -168,7 +168,7 @@ def supported(owner, attn_out):
         return False
     properties = torch.cuda.get_device_properties(attn_out.device)
     return (getattr(properties, 'gcnArchName', '').split(':')[0] == 'gfx938'
-            and properties.multi_processor_count == 64)
+)
 
 
 def project(owner, attn_out):

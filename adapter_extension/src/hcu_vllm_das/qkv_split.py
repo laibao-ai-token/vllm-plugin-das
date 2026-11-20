@@ -60,7 +60,7 @@ def supported(q, kv, cache, slots, positions, cos_sin):
     if (not all(isinstance(t, torch.Tensor) for t in tensors)
             or not (_NATIVE_BUILD_MATCHES or q.device in _qualified_devices)
             or q.ndim != 3 or q.shape[1:] != (64, 512)
-            or not 0 < q.shape[0] <= 64
+            or not 0 < q.shape[0] <= 256
             or kv.shape != (q.shape[0], 512)
             or cache.ndim != 3 or cache.shape[0] <= 0
             or cache.shape[1] not in (32, 64) or cache.shape[2] != 584
@@ -80,7 +80,7 @@ def supported(q, kv, cache, slots, positions, cos_sin):
 
 @triton.jit
 def _q_rope_native_512(Q, Positions, CosSin, Out):
-    token = tl.program_id(0)
+    token = tl.program_id(0).to(tl.int64)
     head = tl.program_id(1) * 4 + tl.arange(0, 4)[:, None]
     col = tl.arange(0, 512)[None, :]
     raw = tl.load(Q + token * 32768 + head * 512 + col).to(tl.float32)
@@ -118,22 +118,23 @@ def qualify_qkv_split(device):
         try:
             fused, _ = _native_ops()
             generator = torch.Generator(device=device).manual_seed(5924)
-            angle = torch.randn((256, 32), device=device, dtype=torch.float32,
+            angle = torch.randn((768, 32), device=device, dtype=torch.float32,
                                 generator=generator)
             cos_sin = torch.cat((angle.cos(), angle.sin()), dim=1)
             for block_size in (32, 64):
-                for rows in (1, 8, 48, 64):
+                for rows in (1, 8, 48, 64, 192, 256):
                     q = torch.randn((rows, 64, 512), device=device, generator=generator).bfloat16()
                     kv = torch.randn((rows, 512), device=device, generator=generator).bfloat16()
                     positions = torch.arange(rows, device=device) * 3
                     slots = torch.arange(rows, device=device) * 2
                     slots[1::3] = -1
+                    pages = max(4, (2 * rows + block_size - 1) // block_size)
                     for count, pitch in ((rows, 0), (rows // 2, 128)):
                         expected_backing = torch.full(
-                            (4, block_size * 584 + pitch), 17, dtype=torch.uint8, device=device)
+                            (pages, block_size * 584 + pitch), 17, dtype=torch.uint8, device=device)
                         actual_backing = expected_backing.clone()
                         expected_cache = expected_backing[:, :block_size * 584]
-                        actual_cache = actual_backing[:, :block_size * 584].view(4, block_size, 584)
+                        actual_cache = actual_backing[:, :block_size * 584].view(pages, block_size, 584)
                         expected_q = fused(q, kv, expected_cache, slots[:count], positions,
                                            cos_sin, 64, 1e-6, block_size, False, False, True, False)
                         actual_q = _split_qkv(q, kv, actual_cache, slots[:count], positions, cos_sin)
