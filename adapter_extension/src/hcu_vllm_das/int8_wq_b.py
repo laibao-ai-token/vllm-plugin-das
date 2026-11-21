@@ -56,7 +56,13 @@ def _reviewed_source():
     amd, base, indexer = (rocm.DeepseekV41ROCMAiterMLAAttention,
                           common.DeepseekV4Attention, common.DeepseekV4Indexer)
     kernel = triton.TritonInt8ScaledMMLinearKernel
-    return all(_source_matches(fn, digest) for fn, digest in (
+    method = HcuDSV41Int8LinearMethod
+    if (method.apply is not getattr(method, '_hcu_wq_b_int8_apply_v1', None)
+            or method.process_weights_after_loading is not getattr(
+                method, '_hcu_wq_b_int8_finalize_v1', None)):
+        _LOG.warning_once('INT8 WQ-B adapter method contract unavailable')
+        return False
+    reviewed = (
         (amd.forward, '3152e366240c837a1b12c2f28094dad235fabe5e2743450c2b38bb6b9b88b5f8'),
         (amd._forward_csa2_full, '5c5e13336e9d76ea02f585d18a5e3935c11bf5998a42972980c7f89da93b7b6f'),
         (amd._forward_csa2_reindex, 'a55aa720527b95dd14effc4d9de6316bdd345a5cf447e1f16b5477643001cdcd'),
@@ -67,16 +73,18 @@ def _reviewed_source():
         (indexer.forward, '9a7000f080675c697ee3ebd18e437122b7bdb8f4e5c3f87ae8576c147bd17a88'),
         (ColumnParallelLinear.forward, '308fabe081224a58eafc09a982aac11fb31ddc1d73ea5f5ef33085fca446a56c'),
         (ReplicatedLinear.forward, 'ca4826436841648b26a8b83c4026abadab32a29b86359261900dd936b13939d2'),
-        (HcuDSV41Int8LinearMethod.apply, 'd2301c349d190be8fdb36e8a14116be1403ffa9f30d757fe3427e6ad4244e03a'),
-        (HcuDSV41Int8LinearMethod.process_weights_after_loading,
-         '9d56f0fd1d8b2bfa71974d8ab63715b6efd4e3ad523056b7ae8836029fd21411'),
         (CompressedTensorsLinearMethod.apply, 'f2267a9c76789466651134de4df7a8ec75fb0928c0b8780c82443c07f62abe73'),
         (CompressedTensorsW8A8Int8.apply_weights, '7560e8139c47af3606304a13dd4aee4aaa5ec8f9a7a7f050d73e8001c575ec5f'),
         (kernel.apply_weights, 'c825e9cc457413d572e4bcffafd50d3256026d36e3ab83208947e7337371b0eb'),
         (kernel._get_layer_params, '748b270e83d959bdd74167e048c8df573806f6928930061aa08c06d1ab5489e1'),
         (triton._int8_scaled_mm_func, '90fac41461e287ff9da855adc7408073d459bc729ac5f0a8dd3e99413592b940'),
         (_native_quant(), '195d8e863eb49e6ba2e59f6f822845a956a722f12a7a3b185c279a84d6b1f2ab'),
-    ))
+    )
+    for fn, digest in reviewed:
+        if not _source_matches(fn, digest):
+            _LOG.warning_once('INT8 WQ-B native source differs: %s', fn.__qualname__)
+            return False
+    return True
 
 
 def _registered_ops():
@@ -221,6 +229,7 @@ def share(cfg, device, attention, qr, qr_scale):
         payload, scale, azp = _native_quant()(qr.contiguous(), None, None, symmetric=True)
     if azp is not None or not _valid_pair(payload, scale) or payload.shape != qr.shape:
         raise RuntimeError('INT8 WQ-B native dynamic quant returned an invalid operand')
+    _LOG.info_once('INT8 WQ-B shared operand captured')
     return payload, scale
 
 

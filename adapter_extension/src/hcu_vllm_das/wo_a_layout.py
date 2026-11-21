@@ -37,10 +37,13 @@ _SOURCE_MATCHES = (not _BLAS_OVERRIDDEN
                    and supports_operator_contract(torch, 'rocm_bf16_bmm_einsum_parity'))
 _qualified_devices = set()
 _LOG = logging.getLogger('vllm.' + __name__)
+_CAPTURE_LOG = os.getenv('HCU_VLLM_WO_A_CAPTURE_LOG') == '1'
+_logged_capture_devices = set()
 
 
 def _clear_preflight():
     _qualified_devices.clear()
+    _logged_capture_devices.clear()
     _qualify_layout.cache_clear()
 
 
@@ -111,7 +114,7 @@ def _qualify_layout(device, cache, transposed):
                     rotary_emb=None, rope_head_dim=64,
                     wo_a=SimpleNamespace(weight=physical_weight),
                     _wo_b_after_wo_a=lambda value: value)
-                for rows in (1, 8, 17, 32, 48, 64, 65, 128, 192, 255, 256):
+                for rows in (1, 2, 8, 17, 32, 48, 64, 65, 128, 192, 255, 256):
                     for heads in (64, 128):
                         attn_out = torch.randn((rows, heads, 512), dtype=torch.bfloat16,
                                                device=device, generator=generator)
@@ -174,7 +177,12 @@ def supported(owner, attn_out):
 def project(owner, attn_out):
     if not supported(owner, attn_out):
         raise ValueError('WO_A token-major output is outside the verified W4A8 contract')
-    return _project(native._get_cached_wo_a_bf16, owner.wo_a, attn_out)
+    output = _project(native._get_cached_wo_a_bf16, owner.wo_a, attn_out)
+    if (_CAPTURE_LOG and attn_out.device not in _logged_capture_devices
+            and torch.cuda.is_current_stream_capturing()):
+        _logged_capture_devices.add(attn_out.device)
+        _LOG.info('HCU token-major WO-A consumer layout captured')
+    return output
 
 
 def _project(cache, wo_a, attn_out):
