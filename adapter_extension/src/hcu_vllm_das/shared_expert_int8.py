@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Opt-in eager SwiGLU prequantization for V4.1 CT INT8 shared experts."""
+"""Opt-in SwiGLU prequantization for V4.1 CT INT8 shared experts."""
 from functools import partial
 import os
 
@@ -17,9 +17,7 @@ _ENV = 'HCU_DSV41_SHARED_EXPERT_INT8_FUSION'
 def bind_shared_expert(config, moe):
     if os.getenv(_ENV) != '1':
         return
-    if not config.model_config.enforce_eager:
-        return
-    _LOG.warning_once('HCU DSV4.1 shared expert INT8 fusion requested in eager decoder')
+    _LOG.warning_once('HCU DSV4.1 shared expert INT8 fusion requested')
     parallel = config.parallel_config
     if (parallel.tensor_parallel_size != 1
             or parallel.prefill_context_parallel_size != 1
@@ -55,7 +53,7 @@ def bind_shared_expert(config, moe):
         _LOG.warning_once('Shared expert INT8 fusion skipped because LightOp clamp quantization is unavailable')
         return
     mlp.forward = partial(_forward, mlp, mlp.forward, fuse_silu_mul_clamp_quant)
-    _LOG.warning_once('HCU DSV4.1 shared expert INT8 fusion bound to eager MLP')
+    _LOG.warning_once('HCU DSV4.1 shared expert INT8 fusion bound to MLP')
 
 
 def _forward(mlp, original, quantize, x):
@@ -65,7 +63,7 @@ def _forward(mlp, original, quantize, x):
             or not x.is_cuda or not 1 <= x.shape[0] <= 256
             or not method.supports_shared_expert_prequantized(down)):
         if x.ndim == 2 and 1 <= x.shape[0] <= 256:
-            _LOG.warning_once('Shared expert INT8 eager fallback: shape=%s dtype=%s gateup=%s weight=%s scale=%s',
+            _LOG.warning_once('Shared expert INT8 fallback: shape=%s dtype=%s gateup=%s weight=%s scale=%s',
                            tuple(x.shape), x.dtype, mlp._gateup_scale is not None,
                            tuple(down.weight.shape), tuple(down.weight_scale.shape))
         return original(x)
@@ -76,5 +74,9 @@ def _forward(mlp, original, quantize, x):
         output, _ = down(mlp.act_fn(gate_up))
         return output
     q, scale = quantize(gate_up, mlp.act_fn.swiglu_limit)
+    output = method.apply_prequantized(down, q, scale)
+    if torch.cuda.is_current_stream_capturing():
+        _LOG.warning_once('HCU DSV4.1 shared expert INT8 fused SwiGLU quantization captured')
+        return output
     _LOG.warning_once('HCU DSV4.1 shared expert INT8 fused SwiGLU quantization active')
-    return method.apply_prequantized(down, q, scale)
+    return output

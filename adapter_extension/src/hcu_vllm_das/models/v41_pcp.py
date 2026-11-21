@@ -202,9 +202,9 @@ class HcuV41Fp4DecoderLayer(native.DeepseekV4DecoderLayer):
         cfg = args[0] if args else kwargs['vllm_config']
         init = _FP4_HOST_DECODER_INIT if use_host_target(cfg) else _FP4_DECODER_INIT
         init(self, *args, **kwargs)
-        if cfg.model_config.enforce_eager:
-            from ..shared_expert_int8 import bind_shared_expert
-            bind_shared_expert(cfg, self.ffn)
+        from ..shared_expert_int8 import bind_shared_expert
+
+        bind_shared_expert(cfg, self.ffn)
         if not self.use_sequence_parallel and self.attn._int8_wq_b_direct is not None:
             from ..int8_wq_b import bind_decoder_direct_gemm
 
