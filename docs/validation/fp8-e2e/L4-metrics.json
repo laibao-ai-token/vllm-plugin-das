@@ -1,0 +1,28 @@
+{
+  "item": 4,
+  "gain_pct": 1.1948733253537478,
+  "base_wall_ms": 85.189773125,
+  "candidate_wall_ms": 84.17186325,
+  "verdict": "accepted-user-prof-and-smoke-gates",
+  "base_control": "20261123_013213_sgdkay",
+  "candidate": "20261123_012327_2ULJ9t",
+  "basis": "dedicated same-batch WO_A_TOKEN_MAJOR=0 Base, all other workload flags unchanged, stackfalse fixed steps7..14, CPU-load caveat",
+  "smoke": {
+    "completed": 32,
+    "failed": 0,
+    "duration": 61.353310726583004,
+    "mean_tpot_ms": 51.11805818925356,
+    "output_throughput": 534.0869076491803,
+    "duration_limit": 68.10643240609207,
+    "tpot_limit": 56.86227071315428,
+    "pass": true
+  },
+  "model_accuracy": "deferred by user; not established",
+  "window_selector": "rank0 ProfilerStep#7..14; exclude last two boundary steps on both sides",
+  "trace_hits": {
+    "candidate_worker_preflight": 8,
+    "candidate_graph_capture": 8,
+    "base_graph_capture": 0
+  },
+  "baseline_history_sha256": "14b2e70992372b3940ea1868cff32b5e527b87e1613628554b7cfed050f04f26"
+}
